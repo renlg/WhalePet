@@ -1,0 +1,302 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="UTF-8">
+<title>鲸鱼娘 Live2D</title>
+<style>
+html, body {
+    margin: 0; padding: 0;
+    background: transparent;
+    overflow: hidden;
+    width: 100%; height: 100%;
+}
+#canvas { display: block; width: 100%; height: 100%; }
+#bubble {
+    position: absolute;
+    top: 8px; left: 50%;
+    transform: translateX(-50%);
+    max-width: 320px;
+    max-height: 60px;           /* 最多 3 行 (13px × 1.5 行高), 超长文字内部滚动 */
+    overflow-y: auto;           /* 长文字滚动 */
+    overflow-x: hidden;
+    background: rgba(255,255,255,0.95);
+    color: #333;
+    border-radius: 14px;
+    padding: 10px 14px;
+    font: 13px/1.5 -apple-system, "PingFang SC", sans-serif;
+    box-shadow: 0 4px 16px rgba(0,0,0,0.18);
+    display: none;
+    word-break: break-word;
+    white-space: pre-wrap;
+    z-index: 99;
+    scrollbar-width: thin;      /* Firefox 细滚动条 */
+}
+#bubble::-webkit-scrollbar { width: 4px; }
+#bubble::-webkit-scrollbar-thumb { background: rgba(0,0,0,0.25); border-radius: 2px; }
+#bubble::after {
+    content: '';
+    position: absolute;
+    bottom: -8px; left: 50%;
+    transform: translateX(-50%);
+    border: 8px solid transparent;
+    border-top-color: rgba(255,255,255,0.95);
+    border-bottom: none;
+}
+</style>
+</head>
+<body>
+<canvas id="canvas"></canvas>
+<div id="bubble"></div>
+<script src="vendor/live2dcubismcore.min.js"></script>
+<script src="vendor/pixi.min.js"></script>
+<script src="vendor/cubism4.min.js"></script>
+<script>
+;(function(){
+  'use strict'
+  const canvas = document.getElementById('canvas')
+  const W = window.innerWidth || 400
+  const H = window.innerHeight || 560
+
+  // PIXI + Live2D (分辨率 1:1 逻辑像素, WebView 自己处理 DPR)
+  const app = new PIXI.Application({
+    view: canvas,
+    width: W,
+    height: H,
+    backgroundAlpha: 0,
+    antialias: true,
+    autoStart: true,
+    resolution: 1,
+  })
+  app.ticker.maxFPS = 30
+
+  const { Live2DModel } = PIXI.live2d
+  Live2DModel.registerTicker(PIXI.Ticker)
+
+  let model
+  // 模型原始尺寸 (scale=1 时的尺寸, 固定值)
+  // 注意: model.width 是"显示宽度", 会随 scale 变化, 不能用来算 scale (会形成反馈循环导致模型忽大忽小)
+  let MW = 0
+  let MH = 0
+  let modelLocalBounds = { x: 0, y: 0, width: 0, height: 0 }
+  const CONTENT_PER_SCALE = 400 * 0.95 / 3
+  const tightPadding = content => ({
+    x: Math.max(20, content * (20 / 380)),
+    y: Math.max(48, content * (60 / 380)),
+  })
+
+  // 只依赖倍率与缓存 local bounds 比例，不读取当前 model scale，避免尺寸反馈环。
+  window.__getTightSize = function(scale) {
+    if (!MW || !MH) return null
+    const contentW = CONTENT_PER_SCALE * scale
+    const contentH = contentW * (MH / MW)
+    const pad = tightPadding(Math.max(contentW, contentH))
+    return { width: Math.ceil(contentW + pad.x), height: Math.ceil(contentH + pad.y) }
+  }
+
+  let currentCharRect = null
+  window.__getCharRect = function() { return currentCharRect }
+
+  async function init() {
+    model = await Live2DModel.from('model/c_0120.model3.json', {
+      autoInteract: false,
+      autoUpdate: true,
+      idleMotionGroup: 'idle',
+    })
+    model.eventMode = 'none'
+    // 暴露到 window 供 Swift 壳调用
+    window.__petModel = model
+
+    // 记录 scale=1 的固定 local bounds。model.width/height 会随 scale 改变，
+    // local bounds 的 x/y 也必须保留，否则模型内容不从 (0,0) 开始时会偏移裁切。
+    model.scale.set(1)
+    const initialBounds = model.getLocalBounds()
+    modelLocalBounds.x = initialBounds.x
+    modelLocalBounds.y = initialBounds.y
+    modelLocalBounds.width = initialBounds.width
+    modelLocalBounds.height = initialBounds.height
+    MW = initialBounds.width
+    MH = initialBounds.height
+    app.stage.addChild(model)
+    console.log('LOCAL_BOUNDS: x=' + modelLocalBounds.x.toFixed(1)
+      + ' y=' + modelLocalBounds.y.toFixed(1)
+      + ' w=' + MW.toFixed(1) + ' h=' + MH.toFixed(1))
+    fitCanvas('init')
+    console.log('Live2D model loaded:', MW, MH)
+
+    // 启动后定期报告状态 (给 Swift 壳)
+    try {
+      window.webkit.messageHandlers.hermes.postMessage('READY')
+    } catch(e) {}
+  }
+
+  // 点击: 随机动作 (用 pixi-live2d 的 motion API, FORCE 优先级盖过 idle)
+  canvas.addEventListener('click', () => {
+    if (!model) return
+    const groups = ['selfie', 'ketchup', 'bubble', 'splash', 'openLid', 'aidale']
+    const g = groups[Math.floor(Math.random() * groups.length)]
+    try {
+      model.motion(g, 0, 3)  // 3 = FORCE 优先级
+      console.log('play motion:', g)
+    } catch(e) {
+      console.error('motion error:', e)
+    }
+  })
+
+  // 气泡显示 (Swift 壳调用) — 打字机逐字效果
+  // durationMs > 0: 文字按音频时长均匀打出 (字音同步); 0: 固定 40ms/字
+  window.__showBubble = function(text, durationMs) {
+    const b = document.getElementById('bubble')
+    if (!b) return
+    b.style.display = 'block'
+    clearTimeout(window.__bubbleTimer)
+    clearInterval(window.__typeTimer)
+    b.textContent = ''
+    const chars = Array.from(text)
+    if (chars.length === 0) return
+    let i = 0
+    let intervalMs = 40
+    if (durationMs && durationMs > 0) {
+      intervalMs = Math.max(16, Math.round(durationMs / chars.length))
+    }
+    // 逐字显示: 默认 40ms/字; 有音频时长时按时长均分, 与语音同步结束
+    window.__typeTimer = setInterval(() => {
+      b.textContent += chars[i]
+      i++
+      // 长文字自动滚动到底部 (打字机跟随)
+      if (b.scrollHeight > b.clientHeight) {
+        b.scrollTop = b.scrollHeight
+      }
+      if (i >= chars.length) {
+        clearInterval(window.__typeTimer)
+        window.__bubbleTimer = setTimeout(() => { b.style.display = 'none' }, 8000)
+      }
+    }, intervalMs)
+  }
+
+  // 尺寸调整: innerWidth/innerHeight 是唯一真值，避免 Swift 调用与 WebView layout 竞态。
+  function fitCanvas(reason) {
+    if (!model || !app.renderer || !MW || !MH) return
+    const w = Math.max(1, Math.round(window.innerWidth || document.documentElement.clientWidth || W))
+    const h = Math.max(1, Math.round(window.innerHeight || document.documentElement.clientHeight || H))
+    app.renderer.resize(w, h)
+    // canvas CSS 尺寸跟随 (PIXI resize 只改像素属性, 不改 CSS)
+    const cv = app.renderer.view
+    cv.style.width = '100%'
+    cv.style.height = '100%'
+    // 用固定原始尺寸算缩放 (避免 model.width 反馈循环)
+    // 为 idle/motion 保留安全留白；公式与 __getTightSize 一致。
+    const nominalContent = Math.min(w / 1.0527, h / 1.158)
+    const pad = tightPadding(nominalContent)
+    const scale = Math.max(0.0001, Math.min((w - pad.x) / MW, (h - pad.y) / MH))
+    model.scale.set(scale)
+    // 按实际内容 bounds（包括其 local x/y 偏移）居中，而不是假设原点在左上角。
+    model.x = (w - MW * scale) / 2 - modelLocalBounds.x * scale
+    model.y = (h - MH * scale) / 2 - modelLocalBounds.y * scale
+    const b = model.getBounds()
+    currentCharRect = { x: b.x, y: b.y, w: b.width, h: b.height }
+    try {
+      window.webkit.messageHandlers.hermes.postMessage(Object.assign({ type: 'charRect' }, currentCharRect))
+    } catch(e) {}
+    const css = window.getComputedStyle(cv)
+    const inside = b.x >= -0.5 && b.y >= -0.5
+      && b.x + b.width <= w + 0.5 && b.y + b.height <= h + 0.5
+    console.log('FIT: reason=' + reason
+      + ' inner=' + window.innerWidth + 'x' + window.innerHeight
+      + ' canvasAttr=' + cv.width + 'x' + cv.height
+      + ' css=' + css.width + 'x' + css.height
+      + ' scale=' + scale.toFixed(4)
+      + ' modelPos=' + model.x.toFixed(1) + ',' + model.y.toFixed(1)
+      + ' bounds=' + b.x.toFixed(1) + ',' + b.y.toFixed(1)
+      + ',' + b.width.toFixed(1) + 'x' + b.height.toFixed(1)
+      + ' inside=' + inside)
+    console.log('BOUNDS: x=' + b.x.toFixed(1) + ' y=' + b.y.toFixed(1)
+      + ' w=' + b.width.toFixed(1) + ' h=' + b.height.toFixed(1))
+  }
+  window.__resize = function(w, h) {
+    fitCanvas('swift(' + w + 'x' + h + ')')
+  }
+  // WebView 视口变化自动适配 (Swift 改窗口尺寸时触发)
+  window.addEventListener('resize', () => {
+    fitCanvas('window.resize')
+  })
+
+  // 情绪表情 (Swift 壳调用): 传情绪词, 播放对应表情
+  const EXPR_MAP = {
+    '开心': '开心兴奋', '高兴': '开心兴奋', '兴奋': '开心兴奋', '愉快': '开心兴奋', '喜悦': '开心兴奋',
+    '悲伤': '悲伤', '难过': '悲伤', '伤心': '悲伤', '沮丧': '悲伤', '失落': '悲伤',
+    '生气': '生气', '愤怒': '生气', '气': '生气', '恼': '生气',
+    '哭': '哭', '哭泣': '哭', '大哭': '哭',
+    '脸红': '脸红', '害羞': '脸红', '害羞': '脸红', '腼腆': '脸红',
+    '星星': '星星眼', '崇拜': '星星眼', '星星眼': '星星眼', '期待': '星星眼',
+    '爱心': '爱心眼', '爱': '爱心眼', '喜欢': '爱心眼', '心动': '爱心眼',
+    '晕': '晕晕', '晕晕': '晕晕', '头晕': '晕晕', '晕倒': '晕晕',
+    '吐舌': '吐舌', '调皮': '调皮', '俏皮': '调皮', '淘气': '调皮',
+    '吐魂': '吐魂', '累': '吐魂', '疲惫': '吐魂', '虚脱': '吐魂',
+    '流汗': '流汗', '汗': '流汗', '尴尬': '流汗', '无奈': '流汗',
+    '发呆': '呆呆眼', '呆': '呆呆眼', '懵': '呆呆眼', '迷茫': '呆呆眼',
+    '问号': '问号', '疑惑': '问号', '疑问': '问号', '不解': '问号',
+    '惊讶': '感叹号', '惊': '感叹号', '震惊': '感叹号', '吓': '感叹号',
+    '阴暗': '阴暗', '黑化': '阴暗', '腹黑': '阴暗',
+  }
+  const MOTION_MAP = {
+    '开心': 'selfie', '高兴': 'selfie', '愉快': 'selfie', '喜悦': 'selfie',
+    '兴奋': 'bubble', '星星': 'bubble', '星星眼': 'bubble', '崇拜': 'bubble', '期待': 'bubble',
+    '调皮': 'selfieQuick', '俏皮': 'selfieQuick', '淘气': 'selfieQuick', '吐舌': 'selfieQuick',
+    '生气': 'ketchup', '愤怒': 'ketchup', '气': 'ketchup', '恼': 'ketchup',
+    '害羞': 'aidale', '脸红': 'aidale', '腼腆': 'aidale',
+    '心动': 'aidale', '爱心': 'aidale', '爱': 'aidale', '喜欢': 'aidale',
+    '惊讶': 'openLid', '震惊': 'openLid', '惊': 'openLid', '吓': 'openLid',
+    '哭': 'splash', '哭泣': 'splash', '大哭': 'splash',
+    '悲伤': 'splash', '难过': 'splash', '伤心': 'splash', '沮丧': 'splash', '失落': 'splash',
+  }
+  const MOTION_GROUPS = new Set([
+    'idle', 'aidale', 'selfie', 'selfieQuick',
+    'ketchup', 'openLid', 'bubble', 'splash'
+  ])
+  window.__setMotion = function(group) {
+    if (!MOTION_GROUPS.has(group)) {
+      console.error('unknown motion group:', group)
+      return
+    }
+    if (!model) {
+      console.error('motion model not ready:', group)
+      return
+    }
+    try {
+      model.motion(group, 0, 3)  // 3 = FORCE 优先级
+      console.log('set motion:', group)
+    } catch(e) {
+      console.error('set motion error:', group, e)
+    }
+  }
+  window.__setEmotion = function(emotion) {
+    if (!model) return
+    const expr = EXPR_MAP[emotion] || EXPR_MAP[emotion.split('')[0]]
+    // 未映射的情绪默认回 idle 待机 (避免残留上一个动作)
+    const motion = MOTION_MAP[emotion] || MOTION_MAP[emotion.split('')[0]] || 'idle'
+    if (expr) {
+      try {
+        model.expression(expr)  // 播放表情 (自动淡入淡出)
+        console.log('expression:', emotion, '->', expr)
+      } catch(e) {
+        console.error('expression error:', e)
+      }
+    }
+    if (motion) {
+      try {
+        model.motion(motion, 0, 3)  // 0 = 组内第一个动作, 3 = FORCE 优先级
+        console.log('emotion motion:', emotion, '->', motion)
+      } catch(e) {
+        console.error('emotion motion error:', e)
+      }
+    }
+  }
+
+  init().catch(e => {
+    console.error('init error:', e)
+    document.title = '加载失败: ' + e.message
+  })
+})()
+</script>
+</body>
+</html>

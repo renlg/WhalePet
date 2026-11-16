@@ -1,0 +1,23 @@
+# Build artifacts
+WhalePetL2D
+WhalePet.app/
+*.o
+buildcache/
+
+# Logs & debug
+webview.log
+/tmp/pet_*_cmd
+
+# Backups
+*.pre*
+*.pre-codex
+
+# macOS
+.DS_Store
+.AppleDouble
+._*
+
+# Secrets
+.env
+*.pem
+*.key
