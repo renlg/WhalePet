@@ -537,18 +537,31 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
         }
         let yRatio = min(1, max(0, (point.y - rect.minY) / rect.height))
         if isDoubleClick {
+            // 双击 = 打开聊天框 (若已开着则关闭 = toggle)
+            if isInputOpen { dismissInputBar() } else { startChat(playGreeting: false) }
             playReaction(emotion: "惊讶", motion: "splash")
-            handleJSEvent("CLICK_PART: double -> startled/splash")
-            startChat(playGreeting: false)
+            handleJSEvent("CLICK_PART: double -> toggle chat")
         } else if yRatio < 0.35 {
             playReaction(emotion: "开心", motion: "aidale")
             handleJSEvent("CLICK_PART: head -> happy/aidale")
             startChat(playGreeting: false)
         } else if yRatio < 0.75 {
+            // 点身体: 若输入框开着则先关闭 (否则一直挂着无法关)
+            if isInputOpen {
+                dismissInputBar()
+                handleJSEvent("CLICK_PART: body -> dismiss chat")
+                return
+            }
             playReaction(emotion: "调皮", motion: "bubble")
             showBubble("好痒呀～", durationMs: 1600)
             handleJSEvent("CLICK_PART: body -> tickle/bubble")
         } else {
+            // 点尾巴: 若输入框开着则先关闭
+            if isInputOpen {
+                dismissInputBar()
+                handleJSEvent("CLICK_PART: tail -> dismiss chat")
+                return
+            }
             playReaction(emotion: "开心", motion: "splash")
             handleJSEvent("CLICK_PART: tail -> happy/splash")
         }
