@@ -671,6 +671,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
                             self.voiceChatText = text
                             self.voiceChatLastSpeechAt = Date()
                             if self.voiceChatUtteranceStartedAt == nil { self.voiceChatUtteranceStartedAt = Date() }
+                            // 实时显示识别到的文字, 让用户知道正在被听到 (整段直接显示, 不重打不闪烁)
+                            self.showBubble("你说: " + text, instant: true)
                         }
                     } else {
                         self.resetVoiceChatUtterance()
@@ -1650,8 +1652,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
     }
 
     // 页面里显示气泡
-    func showBubble(_ text: String, durationMs: Int = 0) {
-        let js = "window.__showBubble ? window.__showBubble('\(jsEscapedString(text))', \(durationMs)) : 0"
+    func showBubble(_ text: String, durationMs: Int = 0, instant: Bool = false) {
+        let js = "window.__showBubble ? window.__showBubble('\(jsEscapedString(text))', \(durationMs), \(instant ? "true" : "false")) : 0"
         webView.evaluateJavaScript(js, completionHandler: nil)
     }
 

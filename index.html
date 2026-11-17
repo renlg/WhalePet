@@ -156,13 +156,18 @@ html, body {
 
   // 气泡显示 (Swift 壳调用) — 打字机逐字效果
   // durationMs > 0: 文字按音频时长均匀打出 (字音同步); 0: 固定 40ms/字
-  window.__showBubble = function(text, durationMs) {
+  // instant=true: 整段直接显示, 不重打 (语音识别实时更新用, 避免闪烁)
+  window.__showBubble = function(text, durationMs, instant) {
     const b = document.getElementById('bubble')
     if (!b) return
     b.style.display = 'block'
     clearTimeout(window.__bubbleTimer)
     clearInterval(window.__typeTimer)
     b.textContent = ''
+    if (instant) {
+      b.textContent = text
+      return
+    }
     const chars = Array.from(text)
     if (chars.length === 0) return
     let i = 0
