@@ -210,7 +210,7 @@ final class InputBar: NSView, NSTextFieldDelegate {
         micBtn.target = self
         micBtn.action = #selector(microphoneTapped)
         micBtn.bezelStyle = .rounded
-        micBtn.toolTip = "录音复读（最长 5 秒）"
+        micBtn.toolTip = "语音对话（按住说话，停顿自动提交）"
         micBtn.autoresizingMask = [.minXMargin]
         addSubview(micBtn)
 
@@ -238,9 +238,9 @@ final class InputBar: NSView, NSTextFieldDelegate {
     @objc func sendTapped() { onSend?(textField.stringValue) }
     @objc func microphoneTapped() { onMicrophone?() }
 
-    func setRecording(_ recording: Bool) {
-        micBtn.title = recording ? "🔴" : "🎤"
-        textField.placeholderString = recording ? "听你说话..." : "输入你想说的话... 回车发送"
+    func setListening(_ listening: Bool) {
+        micBtn.title = listening ? "🔴" : "🎤"
+        textField.placeholderString = listening ? "在听呢，说完停顿一下..." : "输入你想说的话... 回车发送"
     }
 
     override func keyDown(with event: NSEvent) {
@@ -284,16 +284,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
     var speechOutputPath: String?
     var speechEndObserver: NSObjectProtocol?
     var speechFailureObserver: NSObjectProtocol?
-    // ———— 复读变声 ————
+    // ———— 语音识别（🎤 手动语音对话 + 常驻语音对话共用） ————
     private let recordingEngine = AVAudioEngine()
-    private var recordingFile: AVAudioFile?
     private var recognitionRequest: SFSpeechAudioBufferRecognitionRequest?
     private var recognitionTask: SFSpeechRecognitionTask?
-    private var recognizedRepeatText = ""
-    private var recordingTimer: Timer?
     private var isRecording = false
-    private var voicePlaybackEngine: AVAudioEngine?
-    // ———— 免手持语音对话（与复读功能共用 recordingEngine） ————
+    // ———— 免手持语音对话 ————
     private var isVoiceChatListening = false
     private var voiceChatText = ""
     private var voiceChatLastSpeechAt: Date?
@@ -302,6 +298,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
     private var voiceChatReplyMonitor: Timer?
     private var isVoiceChatConversationActive = false
     private var voiceChatDiscardingInput = false
+    private var voiceChatManualMode = false   // 🎤 手动模式 (由输入框按钮触发)
     var wanderTimer: Timer?
     var lastActivity = Date()
     var isUserDragging = false
@@ -512,7 +509,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
             self?.dismissInputBar()
         }
         bar.onMicrophone = { [weak self] in
-            self?.toggleVoiceRepeat()
+            self?.toggleVoiceChat()
         }
         // 左右各留 8pt，并随窗口一起缩放，确保小倍率时发送按钮也不会被裁切。
         let contentW = window.contentView?.bounds.width ?? 300
@@ -583,101 +580,37 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
         }
     }
 
-    // ———— Task 2: 录音、中文识别与变声复读 ————
-    private func toggleVoiceRepeat() {
-        if isRecording {
-            stopVoiceRepeatRecording()
+    // ———— 🎤 手动语音对话 ————
+    private func toggleVoiceChat() {
+        if isVoiceChatListening {
+            // 再次点击 = 停止并提交当前已识别内容
+            stopVoiceChatListener()
             return
         }
-        // AVAudioInputNode 同一 bus 只能有一个 tap；复读期间暂时让出共享引擎。
-        if isVoiceChatListening { stopVoiceChatListener() }
         AVCaptureDevice.requestAccess(for: .audio) { [weak self] granted in
             DispatchQueue.main.async {
                 guard let self else { return }
                 guard granted else {
                     self.showBubble("没有录音权限呢～")
-                    self.handleJSEvent("VOICE_REPEAT: microphone denied")
-                    if self.voiceChatEnabled() { self.startVoiceChatListener() }
+                    self.handleJSEvent("VOICECHAT: microphone denied")
                     return
                 }
-                SFSpeechRecognizer.requestAuthorization { _ in
-                    DispatchQueue.main.async { self.startVoiceRepeatRecording() }
+                SFSpeechRecognizer.requestAuthorization { status in
+                    DispatchQueue.main.async {
+                        guard status == .authorized else {
+                            self.showBubble("没有语音识别权限呢～")
+                            self.handleJSEvent("VOICECHAT: speech denied")
+                            return
+                        }
+                        self.voiceChatManualMode = true
+                        self.beginVoiceChatRecognition(showListeningHint: true, force: true)
+                    }
                 }
             }
         }
     }
 
-    private func startVoiceRepeatRecording() {
-        let input = recordingEngine.inputNode
-        let format = input.outputFormat(forBus: 0)
-        guard format.sampleRate > 0, format.channelCount > 0 else {
-            showBubble("麦克风暂时不可用～")
-            return
-        }
-        let url = URL(fileURLWithPath: "/tmp/pet_user_audio.caf")
-        do {
-            recordingFile = try AVAudioFile(forWriting: url, settings: format.settings)
-            let request = SFSpeechAudioBufferRecognitionRequest()
-            request.shouldReportPartialResults = true
-            recognitionRequest = request
-            recognizedRepeatText = ""
-            recognitionTask?.cancel()
-            recognitionTask = SFSpeechRecognizer(locale: Locale(identifier: "zh-CN"))?.recognitionTask(with: request) { [weak self] result, _ in
-                guard let self, let result else { return }
-                self.recognizedRepeatText = result.bestTranscription.formattedString
-            }
-            input.removeTap(onBus: 0)
-            input.installTap(onBus: 0, bufferSize: 1024, format: format) { [weak self] buffer, _ in
-                try? self?.recordingFile?.write(from: buffer)
-                self?.recognitionRequest?.append(buffer)
-            }
-            recordingEngine.prepare()
-            try recordingEngine.start()
-            isRecording = true
-            inputBar?.setRecording(true)
-            showBubble("听你说话...")
-            handleJSEvent("VOICE_REPEAT: recording started")
-            recordingTimer?.invalidate()
-            recordingTimer = Timer.scheduledTimer(withTimeInterval: 5, repeats: false) { [weak self] _ in
-                self?.stopVoiceRepeatRecording()
-            }
-        } catch {
-            input.removeTap(onBus: 0)
-            showBubble("录音失败了，再试一次吧～")
-            handleJSEvent("VOICE_REPEAT: start failed \(error.localizedDescription)")
-        }
-    }
-
-    private func stopVoiceRepeatRecording() {
-        guard isRecording else { return }
-        isRecording = false
-        recordingTimer?.invalidate()
-        recordingTimer = nil
-        recordingEngine.stop()
-        recordingEngine.inputNode.removeTap(onBus: 0)
-        recordingFile = nil
-        recognitionRequest?.endAudio()
-        inputBar?.setRecording(false)
-        handleJSEvent("VOICE_REPEAT: recording stopped")
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) { [weak self] in
-            guard let self else { return }
-            let text = self.recognizedRepeatText.trimmingCharacters(in: .whitespacesAndNewlines)
-            self.recognitionTask?.cancel()
-            self.recognitionTask = nil
-            self.recognitionRequest = nil
-            if !text.isEmpty {
-                self.playReaction(emotion: "开心", motion: "talk")
-                self.showBubble(text)
-                self.speak(text, emotion: "开心", prosodyOverride: SpeechProsody(rate: "+12%", pitch: "+8Hz", volume: "+8%"))
-                self.handleJSEvent("VOICE_REPEAT: recognized chars=\(text.count)")
-            } else {
-                self.playRecordedVoiceWithPitch()
-            }
-            if self.voiceChatEnabled() { self.startVoiceChatListener() }
-        }
-    }
-
-    // ———— Task 13: 常驻语音对话 ————
+    // ———— 常驻语音对话 ————
     func voiceChatEnabled() -> Bool {
         UserDefaults.standard.bool(forKey: "pet_voiceChat")
     }
@@ -710,8 +643,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
         handleJSEvent("VOICECHAT: permission denied; disabled")
     }
 
-    private func beginVoiceChatRecognition(showListeningHint: Bool = false) {
-        guard voiceChatEnabled(), !isVoiceChatListening, !isRecording else { return }
+    private func beginVoiceChatRecognition(showListeningHint: Bool = false, force: Bool = false) {
+        guard (force || voiceChatEnabled()), !isVoiceChatListening, !isRecording else { return }
+        if !force { voiceChatManualMode = false }   // 常驻模式重置手动标记
         let input = recordingEngine.inputNode
         let format = input.outputFormat(forBus: 0)
         guard format.sampleRate > 0, format.channelCount > 0 else {
@@ -731,7 +665,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
                 guard let self, self.isVoiceChatListening else { return }
                 if let result {
                     let text = result.bestTranscription.formattedString.trimmingCharacters(in: .whitespacesAndNewlines)
-                    if self.voiceChatCanProcessInput() {
+                    if self.voiceChatCanProcessInput(manual: self.voiceChatManualMode) {
                         if !text.isEmpty, text != self.voiceChatText {
                             self.voiceChatText = text
                             self.voiceChatLastSpeechAt = Date()
@@ -765,6 +699,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
                 self?.checkVoiceChatSilence()
             }
             if showListeningHint { showBubble("🎧 在听呢...") }
+            inputBar?.setListening(true)
             handleJSEvent("VOICECHAT: started")
         } catch {
             input.removeTap(onBus: 0)
@@ -775,14 +710,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
         }
     }
 
-    private func voiceChatCanProcessInput() -> Bool {
+    private func voiceChatCanProcessInput(manual: Bool = false) -> Bool {
         let isSpeaking = speechProcess != nil || speechPlayer != nil || speechSynthesizer.isSpeaking
+        if manual {
+            // 🎤 手动模式: 由输入框按钮触发, 监听期间不因 isInputOpen 而丢弃
+            return !isAIReplying && !isSpeaking && !isUserDragging && !isRecording
+        }
         return voiceChatEnabled() && !isAIReplying && !isSpeaking && !isUserDragging && !isInputOpen && !isRecording
     }
 
     private func checkVoiceChatSilence() {
         guard isVoiceChatListening else { return }
-        guard voiceChatCanProcessInput() else {
+        guard voiceChatCanProcessInput(manual: voiceChatManualMode) else {
             resetVoiceChatUtterance()
             voiceChatDiscardingInput = true
             return
@@ -808,7 +747,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
     private func finishVoiceChatUtterance() {
         let text = voiceChatText.trimmingCharacters(in: .whitespacesAndNewlines)
         resetVoiceChatUtterance()
-        guard !text.isEmpty, voiceChatCanProcessInput() else { return }
+        guard !text.isEmpty, voiceChatCanProcessInput(manual: voiceChatManualMode) else { return }
         handleJSEvent("VOICECHAT: recognized text=\(text)")
         handleJSEvent("VOICECHAT: sent-to-AI")
         handleJSEvent("VOICECHAT: reply started")
@@ -835,10 +774,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
     }
 
     private func restartVoiceChatRecognition(after delay: TimeInterval) {
-        guard voiceChatEnabled(), !isRecording else { return }
+        guard (voiceChatManualMode || voiceChatEnabled()), !isRecording else { return }
+        let manual = voiceChatManualMode
         stopVoiceChatRecognitionSession(logStopped: false)
         DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
-            self?.beginVoiceChatRecognition()
+            self?.beginVoiceChatRecognition(force: manual)
         }
     }
 
@@ -854,6 +794,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
         recognitionTask = nil
         recognitionRequest = nil
         resetVoiceChatUtterance()
+        inputBar?.setListening(false)
         if logStopped { handleJSEvent("VOICECHAT: stopped") }
     }
 
@@ -862,35 +803,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
         voiceChatReplyMonitor?.invalidate()
         voiceChatReplyMonitor = nil
         isVoiceChatConversationActive = false
-    }
-
-    private func playRecordedVoiceWithPitch() {
-        let url = URL(fileURLWithPath: "/tmp/pet_user_audio.caf")
-        guard let file = try? AVAudioFile(forReading: url) else {
-            showBubble("没有听清呢～")
-            return
-        }
-        let engine = AVAudioEngine()
-        let player = AVAudioPlayerNode()
-        let pitch = AVAudioUnitTimePitch()
-        pitch.pitch = 300 // +3 semitones
-        engine.attach(player)
-        engine.attach(pitch)
-        engine.connect(player, to: pitch, format: file.processingFormat)
-        engine.connect(pitch, to: engine.mainMixerNode, format: file.processingFormat)
-        player.scheduleFile(file, at: nil) { [weak self] in
-            DispatchQueue.main.async { self?.voicePlaybackEngine = nil }
-        }
-        do {
-            try engine.start()
-            voicePlaybackEngine = engine
-            playReaction(emotion: "开心", motion: "talk")
-            player.play()
-            handleJSEvent("VOICE_REPEAT: pitched audio fallback")
-        } catch {
-            showBubble("复读失败了～")
-            handleJSEvent("VOICE_REPEAT: playback failed \(error.localizedDescription)")
-        }
+        voiceChatManualMode = false
     }
 
     func dismissInputBar() {
