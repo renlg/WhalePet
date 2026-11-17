@@ -73,8 +73,9 @@ html, body {
   Live2DModel.registerTicker(PIXI.Ticker)
 
   let model
-  let talking = false
-  let talkElapsed = 0
+  var talking = false
+  var talkElapsed = 0
+  var pendingAfterTalk = null   // 说话期间排队的动作, 说完后播放
   // 模型原始尺寸 (scale=1 时的尺寸, 固定值)
   // 注意: model.width 是"显示宽度", 会随 scale 变化, 不能用来算 scale (会形成反馈循环导致模型忽大忽小)
   let MW = 0
@@ -128,6 +129,15 @@ html, body {
       talkElapsed += app.ticker.deltaMS / 1000
       const mouthOpen = 0.2 + 0.8 * Math.abs(Math.sin(talkElapsed * Math.PI * 4.5))
       model.internalModel.coreModel.setParameterValueById('ParamMouthOpenY', mouthOpen)
+      // 说话动作播完 → 放行排队动作
+      if (talking && model.internalModel.motionManager.isFinished()) {
+        talking = false
+        if (pendingAfterTalk) {
+          const g = pendingAfterTalk
+          pendingAfterTalk = null
+          window.__setMotion(g)
+        }
+      }
     })
     console.log('LOCAL_BOUNDS: x=' + modelLocalBounds.x.toFixed(1)
       + ' y=' + modelLocalBounds.y.toFixed(1)
@@ -277,6 +287,11 @@ html, body {
     }
     if (!model) {
       console.error('motion model not ready:', group)
+      return
+    }
+    // 说话锁定: 说话动作播完前, 其他动作排队等待 (talk 本身直接放行)
+    if (talking && group !== 'talk') {
+      pendingAfterTalk = group
       return
     }
     talking = group === 'talk'

@@ -1176,11 +1176,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
                 if let target = moveTarget {
                     self.moveWindow(xPercent: target.0, yPercent: target.1, reason: "MOVE_WINDOW", duration: 2.6)
                 }
-                if self.speechEnabled() {
-                    self.showBubble("……")
-                } else {
-                    self.showBubble(text)
-                }
+                // 气泡与说话动作统一由 speak 控制 (语音开关只影响声音, 动作/气泡始终跟随)
                 self.speak(text, emotion: emotion)
             }
         }.resume()
@@ -1450,14 +1446,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
         text.unicodeScalars.contains { CharacterSet.alphanumerics.contains($0) }
     }
 
+    // 说话输出与说话动作强绑定: 语音开关只控制"出不出声", 说话动作始终跟随气泡
     func speak(_ text: String, emotion: String? = nil, prosodyOverride: SpeechProsody? = nil) {
-        guard speechEnabled(), !text.isEmpty else { return }
+        guard !text.isEmpty else { return }
         stopSpeech()
         let speechText = cleanSpeechText(text)
         guard containsSpeechContent(speechText) else {
-            // 启用语音时调用方会先显示“……”，无可读内容时必须恢复完整气泡。
+            // 无可读内容 (纯表情/颜文字): 仍播说话动作 + 显示气泡, 只是不发声
             showBubble(text)
+            startTalkingMotion()
             handleJSEvent("TTS_SKIP: no speakable text after cleaning")
+            return
+        }
+        guard speechEnabled() else {
+            // 语音开关关闭: 播说话动作 + 气泡, 不发声
+            showBubble(text)
+            startTalkingMotion()
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { [weak self] in
+                self?.stopTalkingMotion()
+            }
+            handleJSEvent("TTS_MUTED: speech disabled, motion only")
             return
         }
         let voice = selectedVoice()
@@ -1473,6 +1481,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
         }
         let requestID = UUID()
         speechRequestID = requestID
+        // TTS 生成就开始说话动作 (避免生成期间看起来没反应)
+        startTalkingMotion()
         let output = "/tmp/whalepet_tts_\(requestID.uuidString).mp3"
         let params = prosodyOverride ?? prosody(for: emotion)
         let process = Process()
@@ -1544,7 +1554,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
                     self.handleJSEvent("TTS_PLAYBACK_ERROR: \(String(describing: note.userInfo))")
                     self.stopSpeech()
                 }
-                self.startTalkingMotion()
+                self.startTalkingMotion()  // 幂等: 已在 TTS 生成时启动
                 self.speechPlayer?.play()
                 // 字音同步: 语音开始的同时启动打字机, 文字按音频时长均匀打出
                 let typeJs: String
