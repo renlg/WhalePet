@@ -4,6 +4,7 @@ import Cocoa
 import WebKit
 import Network
 import AVFoundation
+import Speech
 
 // 资源根目录: .app 内 Resources (打包后) 或开发目录 (调试)
 let RESOURCE_DIR: String = {
@@ -111,17 +112,21 @@ final class PassiveWebView: WKWebView {
 // 让第一下点击也能收到 (无边框窗口首击被系统吞掉的问题)
 // 同时实现: 按下拖动=拖窗口, 单击=触发动作
 final class DragView: NSView {
-    var clickAction: (() -> Void)?
+    var clickAction: ((CGPoint, Bool) -> Void)?
+    var activityAction: ((Bool) -> Void)?
+    var dragFeedbackAction: ((Bool) -> Void)?
     var rightClickMenu: NSMenu?
     var characterRect: CGRect?  // 左上角原点、CSS 像素；nil 时兼容旧行为
     private var dragStart: NSPoint?
     private var isDragging = false
+    private var lastClickTime: TimeInterval = 0
 
     override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
 
     override func mouseDown(with event: NSEvent) {
         dragStart = event.locationInWindow
         isDragging = false
+        activityAction?(true)
     }
 
     override func mouseDragged(with event: NSEvent) {
@@ -130,7 +135,11 @@ final class DragView: NSView {
         // 超过阈值判定为拖动, 交给系统原生拖动 (丝滑无晃动)
         if !isDragging && (abs(cur.x - dragStart.x) + abs(cur.y - dragStart.y) > 4) {
             isDragging = true
+            dragFeedbackAction?(true)
             window?.performDrag(with: event)
+            // performDrag 会一直阻塞到系统拖动结束；部分 macOS 版本不会再派发 mouseUp。
+            activityAction?(false)
+            dragFeedbackAction?(false)
         }
     }
 
@@ -139,22 +148,127 @@ final class DragView: NSView {
             let p = convert(event.locationInWindow, from: nil)
             let cssPoint = CGPoint(x: p.x, y: bounds.height - p.y)
             if characterRect?.contains(cssPoint) ?? true {
-                clickAction?()
+                let now = event.timestamp
+                let isDoubleClick = event.clickCount > 1 || now - lastClickTime <= 0.3
+                lastClickTime = now
+                clickAction?(cssPoint, isDoubleClick)
             }
         }
         dragStart = nil
         isDragging = false
+        activityAction?(false)
     }
 
     // 右键弹菜单 (含关闭)
     override func rightMouseDown(with event: NSEvent) {
+        activityAction?(false)
         if let menu = rightClickMenu {
             NSMenu.popUpContextMenu(menu, with: event, for: self)
         }
     }
 }
 
-final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, WKScriptMessageHandler {
+// 自绘输入条: 半透明白圆角容器 + 输入框 + 发送按钮 (替代 NSAlert sheet, 避免点击时父窗口变暗黑幕)
+final class InputBar: NSView, NSTextFieldDelegate {
+    var onSend: ((String) -> Void)?
+    var onCancel: (() -> Void)?
+    var onMicrophone: (() -> Void)?
+    let textField = NSTextField(frame: NSRect(x: 8, y: 8, width: 220, height: 26))
+    private let sendBtn = NSButton(title: "发送", target: nil, action: nil)
+    private let micBtn = NSButton(title: "🎤", target: nil, action: nil)
+
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        wantsLayer = true
+        layer?.cornerRadius = 12
+        layer?.backgroundColor = NSColor(calibratedRed: 0.10, green: 0.16, blue: 0.26, alpha: 0.82).cgColor
+        layer?.borderWidth = 1
+        layer?.borderColor = NSColor.white.withAlphaComponent(0.25).cgColor
+
+        textField.placeholderString = "输入你想说的话... 回车发送"
+        textField.isBezeled = true
+        textField.font = NSFont.systemFont(ofSize: 13)
+        textField.textColor = .white
+        textField.placeholderAttributedString = NSAttributedString(
+            string: "输入你想说的话... 回车发送",
+            attributes: [.foregroundColor: NSColor.white.withAlphaComponent(0.6)]
+        )
+        textField.delegate = self
+        textField.autoresizingMask = [.width, .maxXMargin]
+        addSubview(textField)
+
+        sendBtn.title = "发送"
+        sendBtn.target = self
+        sendBtn.action = #selector(sendTapped)
+        sendBtn.bezelStyle = .rounded
+        sendBtn.contentTintColor = .white
+        sendBtn.layer?.backgroundColor = NSColor.white.withAlphaComponent(0.2).cgColor
+        sendBtn.layer?.cornerRadius = 6
+        sendBtn.autoresizingMask = [.minXMargin]
+        addSubview(sendBtn)
+
+        micBtn.target = self
+        micBtn.action = #selector(microphoneTapped)
+        micBtn.bezelStyle = .rounded
+        micBtn.toolTip = "录音复读（最长 5 秒）"
+        micBtn.autoresizingMask = [.minXMargin]
+        addSubview(micBtn)
+
+        layoutInput()
+    }
+
+    // 子控件随容器宽度自适应 (按钮钉右缘, 输入框占剩余)
+    private func layoutInput() {
+        let w = max(0, bounds.width)
+        let btnW: CGFloat = 56
+        let btnX = max(8, w - btnW - 8)
+        sendBtn.frame = NSRect(x: btnX, y: 8, width: btnW, height: 26)
+        let micX = max(8, btnX - 38)
+        micBtn.frame = NSRect(x: micX, y: 8, width: 32, height: 26)
+        textField.frame = NSRect(x: 8, y: 8, width: max(0, micX - 16), height: 26)
+    }
+
+    override func layout() {
+        super.layout()
+        layoutInput()
+    }
+
+    required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
+
+    @objc func sendTapped() { onSend?(textField.stringValue) }
+    @objc func microphoneTapped() { onMicrophone?() }
+
+    func setRecording(_ recording: Bool) {
+        micBtn.title = recording ? "🔴" : "🎤"
+        textField.placeholderString = recording ? "听你说话..." : "输入你想说的话... 回车发送"
+    }
+
+    override func keyDown(with event: NSEvent) {
+        if event.keyCode == 53 {  // ESC = 取消
+            onCancel?()
+            return
+        }
+        if event.keyCode == 36 || event.keyCode == 76 {  // Enter
+            onSend?(textField.stringValue)
+            return
+        }
+        super.keyDown(with: event)
+    }
+
+    func control(_ control: NSControl, textView: NSTextView, doCommandBy commandSelector: Selector) -> Bool {
+        if commandSelector == #selector(NSResponder.insertNewline(_:)) {
+            onSend?(textField.stringValue)
+            return true
+        }
+        if commandSelector == #selector(NSResponder.cancelOperation(_:)) {
+            onCancel?()
+            return true
+        }
+        return false
+    }
+}
+
+final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, WKScriptMessageHandler, AVSpeechSynthesizerDelegate {
     var window: PetWindow!
     var webView: WKWebView!
     var statusItem: NSStatusItem?
@@ -169,6 +283,35 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
     var speechRequestID = UUID()
     var speechOutputPath: String?
     var speechEndObserver: NSObjectProtocol?
+    var speechFailureObserver: NSObjectProtocol?
+    // ———— 复读变声 ————
+    private let recordingEngine = AVAudioEngine()
+    private var recordingFile: AVAudioFile?
+    private var recognitionRequest: SFSpeechAudioBufferRecognitionRequest?
+    private var recognitionTask: SFSpeechRecognitionTask?
+    private var recognizedRepeatText = ""
+    private var recordingTimer: Timer?
+    private var isRecording = false
+    private var voicePlaybackEngine: AVAudioEngine?
+    // ———— 免手持语音对话（与复读功能共用 recordingEngine） ————
+    private var isVoiceChatListening = false
+    private var voiceChatText = ""
+    private var voiceChatLastSpeechAt: Date?
+    private var voiceChatUtteranceStartedAt: Date?
+    private var voiceChatSilenceTimer: Timer?
+    private var voiceChatReplyMonitor: Timer?
+    private var isVoiceChatConversationActive = false
+    private var voiceChatDiscardingInput = false
+    var wanderTimer: Timer?
+    var lastActivity = Date()
+    var isUserDragging = false
+    var isAIReplying = false
+    var isInputOpen = false   // 输入框/设置面板打开中 = 操作中, 禁止漫游
+    var inputBar: InputBar?  // 自绘输入条 (无系统 sheet)
+    var pendingEmotions: [String] = []   // AI 回复的多情绪标签 (依次播放)
+    var pendingMotions: [String] = []    // AI 回复的多动作标签 (依次播放)
+    var isWindowAnimating = false
+    private var windowAnimationID = UUID()
 
     struct SpeechProsody {
         let rate: String
@@ -211,6 +354,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
     }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        speechSynthesizer.delegate = self
         // 启动内置 HTTP server (提供本地 Live2D 页面)
         httpServer = LocalHTTPServer(root: RESOURCE_DIR, port: SERVER_PORT)
         _ = httpServer?.start()
@@ -273,8 +417,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
         clickView.autoresizingMask = [.width, .height]  // 跟随窗口缩放
         win.contentView = clickView
         clickView.addSubview(web)
-        clickView.clickAction = { [weak self] in
-            self?.startChat()  // 单击 = 对话
+        clickView.clickAction = { [weak self, weak clickView] point, isDoubleClick in
+            guard let self else { return }
+            self.handlePetClick(at: point, in: clickView?.characterRect, isDoubleClick: isDoubleClick)
+        }
+        clickView.activityAction = { [weak self] pressed in
+            self?.isUserDragging = pressed
+            self?.markActivity()
+        }
+        clickView.dragFeedbackAction = { [weak self] dragging in
+            self?.showDragFeedback(dragging)
         }
         // 右键菜单
         let ctxMenu = NSMenu()
@@ -294,10 +446,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
         window = win
         win.orderFrontRegardless()
         startDebugScaleWatcher()
+        scheduleWander()
 
         // 状态栏
         setupStatusBar()
         autoDemoMotion()
+
+        if voiceChatEnabled() {
+            startVoiceChatListener()
+        }
 
         // 点击穿透: 只挡鲸鱼娘所在区域 (页面会通过 hermes handler 通知实际位置)
         // 简化: 整个窗口可点击, 点击后触发动作/对话
@@ -334,30 +491,405 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
 
     // ———— Hermes 对话 ————
 
-    // 单击 = 对话: 弹输入框
-    func startChat() {
-        playMotion()  // 顺便触发个动作
-        let alert = NSAlert()
-        alert.messageText = "🐳 鲸鱼娘"
-        alert.informativeText = "想对我说什么？"
-        alert.addButton(withTitle: "发送")
-        alert.addButton(withTitle: "取消")
-        let input = NSTextField(frame: NSRect(x: 0, y: 0, width: 280, height: 24))
-        input.placeholderString = "输入你想说的话..."
-        alert.accessoryView = input
-        alert.window.level = .floating
-        alert.window.collectionBehavior = [.canJoinAllSpaces, .stationary]
-        NSApp.activate(ignoringOtherApps: true)
-        alert.beginSheetModal(for: window) { [weak self] resp in
-            guard let self, resp == .alertFirstButtonReturn else { return }
-            let text = input.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
-            guard !text.isEmpty else { return }
-            self.askHermes(text)
+    // 单击 = 对话: 弹出内嵌输入条 (自绘, 透明背景, 无系统 sheet 黑幕)
+    func startChat(playGreeting: Bool = true) {
+        if playGreeting { playMotion() }  // 普通入口顺便触发动作；点击反应入口保留指定动作
+        markActivity()
+        isInputOpen = true
+        // 若已显示输入条则复用
+        if let inputBar = inputBar, inputBar.superview != nil {
+            inputBar.textField.becomeFirstResponder()
+            return
         }
+        let bar = InputBar(frame: NSRect(x: 0, y: 0, width: 300, height: 44))
+        bar.onSend = { [weak self] text in
+            self?.dismissInputBar()
+            let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !trimmed.isEmpty else { return }
+            self?.askHermes(trimmed)
+        }
+        bar.onCancel = { [weak self] in
+            self?.dismissInputBar()
+        }
+        bar.onMicrophone = { [weak self] in
+            self?.toggleVoiceRepeat()
+        }
+        // 左右各留 8pt，并随窗口一起缩放，确保小倍率时发送按钮也不会被裁切。
+        let contentW = window.contentView?.bounds.width ?? 300
+        let contentH = window.contentView?.bounds.height ?? 100
+        let barW = max(0, contentW - 16)
+        bar.frame = NSRect(x: 8, y: max(8, contentH - 70),
+                           width: barW, height: 44)
+        bar.autoresizingMask = [.width, .minYMargin]
+        window.contentView?.addSubview(bar)
+        inputBar = bar
+        NSApp.activate(ignoringOtherApps: true)
+        bar.textField.becomeFirstResponder()
+    }
+
+    // ———— Task 1: 点击部位反应 ————
+    private func handlePetClick(at point: CGPoint, in rect: CGRect?, isDoubleClick: Bool) {
+        markActivity()
+        guard let rect, rect.height > 0 else {
+            handleJSEvent("CLICK_PART: unknown -> chat")
+            startChat(playGreeting: false)
+            return
+        }
+        let yRatio = min(1, max(0, (point.y - rect.minY) / rect.height))
+        if isDoubleClick {
+            playReaction(emotion: "惊讶", motion: "splash")
+            handleJSEvent("CLICK_PART: double -> startled/splash")
+            startChat(playGreeting: false)
+        } else if yRatio < 0.35 {
+            playReaction(emotion: "开心", motion: "aidale")
+            handleJSEvent("CLICK_PART: head -> happy/aidale")
+            startChat(playGreeting: false)
+        } else if yRatio < 0.75 {
+            playReaction(emotion: "调皮", motion: "bubble")
+            showBubble("好痒呀～", durationMs: 1600)
+            handleJSEvent("CLICK_PART: body -> tickle/bubble")
+        } else {
+            playReaction(emotion: "开心", motion: "splash")
+            handleJSEvent("CLICK_PART: tail -> happy/splash")
+        }
+    }
+
+    private func playReaction(emotion: String, motion: String) {
+        let js = "window.__setEmotion('\(jsEscapedString(emotion))'); window.__setMotion('\(jsEscapedString(motion))');"
+        webView.evaluateJavaScript(js, completionHandler: nil)
+    }
+
+    // ———— Task 4: 真正开始拖动后才显示惊讶反馈 ————
+    private func showDragFeedback(_ dragging: Bool) {
+        if dragging {
+            webView.evaluateJavaScript("window.__setEmotion('惊讶')", completionHandler: nil)
+            handleJSEvent("DRAG_FEEDBACK: surprised")
+        } else {
+            webView.evaluateJavaScript("window.__resetExpression && window.__resetExpression()", completionHandler: nil)
+            handleJSEvent("DRAG_FEEDBACK: reset")
+        }
+    }
+
+    // ———— Task 2: 录音、中文识别与变声复读 ————
+    private func toggleVoiceRepeat() {
+        if isRecording {
+            stopVoiceRepeatRecording()
+            return
+        }
+        // AVAudioInputNode 同一 bus 只能有一个 tap；复读期间暂时让出共享引擎。
+        if isVoiceChatListening { stopVoiceChatListener() }
+        AVCaptureDevice.requestAccess(for: .audio) { [weak self] granted in
+            DispatchQueue.main.async {
+                guard let self else { return }
+                guard granted else {
+                    self.showBubble("没有录音权限呢～")
+                    self.handleJSEvent("VOICE_REPEAT: microphone denied")
+                    if self.voiceChatEnabled() { self.startVoiceChatListener() }
+                    return
+                }
+                SFSpeechRecognizer.requestAuthorization { _ in
+                    DispatchQueue.main.async { self.startVoiceRepeatRecording() }
+                }
+            }
+        }
+    }
+
+    private func startVoiceRepeatRecording() {
+        let input = recordingEngine.inputNode
+        let format = input.outputFormat(forBus: 0)
+        guard format.sampleRate > 0, format.channelCount > 0 else {
+            showBubble("麦克风暂时不可用～")
+            return
+        }
+        let url = URL(fileURLWithPath: "/tmp/pet_user_audio.caf")
+        do {
+            recordingFile = try AVAudioFile(forWriting: url, settings: format.settings)
+            let request = SFSpeechAudioBufferRecognitionRequest()
+            request.shouldReportPartialResults = true
+            recognitionRequest = request
+            recognizedRepeatText = ""
+            recognitionTask?.cancel()
+            recognitionTask = SFSpeechRecognizer(locale: Locale(identifier: "zh-CN"))?.recognitionTask(with: request) { [weak self] result, _ in
+                guard let self, let result else { return }
+                self.recognizedRepeatText = result.bestTranscription.formattedString
+            }
+            input.removeTap(onBus: 0)
+            input.installTap(onBus: 0, bufferSize: 1024, format: format) { [weak self] buffer, _ in
+                try? self?.recordingFile?.write(from: buffer)
+                self?.recognitionRequest?.append(buffer)
+            }
+            recordingEngine.prepare()
+            try recordingEngine.start()
+            isRecording = true
+            inputBar?.setRecording(true)
+            showBubble("听你说话...")
+            handleJSEvent("VOICE_REPEAT: recording started")
+            recordingTimer?.invalidate()
+            recordingTimer = Timer.scheduledTimer(withTimeInterval: 5, repeats: false) { [weak self] _ in
+                self?.stopVoiceRepeatRecording()
+            }
+        } catch {
+            input.removeTap(onBus: 0)
+            showBubble("录音失败了，再试一次吧～")
+            handleJSEvent("VOICE_REPEAT: start failed \(error.localizedDescription)")
+        }
+    }
+
+    private func stopVoiceRepeatRecording() {
+        guard isRecording else { return }
+        isRecording = false
+        recordingTimer?.invalidate()
+        recordingTimer = nil
+        recordingEngine.stop()
+        recordingEngine.inputNode.removeTap(onBus: 0)
+        recordingFile = nil
+        recognitionRequest?.endAudio()
+        inputBar?.setRecording(false)
+        handleJSEvent("VOICE_REPEAT: recording stopped")
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) { [weak self] in
+            guard let self else { return }
+            let text = self.recognizedRepeatText.trimmingCharacters(in: .whitespacesAndNewlines)
+            self.recognitionTask?.cancel()
+            self.recognitionTask = nil
+            self.recognitionRequest = nil
+            if !text.isEmpty {
+                self.playReaction(emotion: "开心", motion: "talk")
+                self.showBubble(text)
+                self.speak(text, emotion: "开心", prosodyOverride: SpeechProsody(rate: "+12%", pitch: "+8Hz", volume: "+8%"))
+                self.handleJSEvent("VOICE_REPEAT: recognized chars=\(text.count)")
+            } else {
+                self.playRecordedVoiceWithPitch()
+            }
+            if self.voiceChatEnabled() { self.startVoiceChatListener() }
+        }
+    }
+
+    // ———— Task 13: 常驻语音对话 ————
+    func voiceChatEnabled() -> Bool {
+        UserDefaults.standard.bool(forKey: "pet_voiceChat")
+    }
+
+    private func startVoiceChatListener() {
+        guard voiceChatEnabled(), !isVoiceChatListening, !isRecording else { return }
+        AVCaptureDevice.requestAccess(for: .audio) { [weak self] microphoneGranted in
+            guard let self else { return }
+            guard microphoneGranted else {
+                DispatchQueue.main.async { self.disableVoiceChatForMissingPermission() }
+                return
+            }
+            SFSpeechRecognizer.requestAuthorization { [weak self] status in
+                DispatchQueue.main.async {
+                    guard let self else { return }
+                    guard status == .authorized else {
+                        self.disableVoiceChatForMissingPermission()
+                        return
+                    }
+                    self.beginVoiceChatRecognition(showListeningHint: true)
+                }
+            }
+        }
+    }
+
+    private func disableVoiceChatForMissingPermission() {
+        UserDefaults.standard.set(false, forKey: "pet_voiceChat")
+        stopVoiceChatListener()
+        showBubble("没有录音权限呢～")
+        handleJSEvent("VOICECHAT: permission denied; disabled")
+    }
+
+    private func beginVoiceChatRecognition(showListeningHint: Bool = false) {
+        guard voiceChatEnabled(), !isVoiceChatListening, !isRecording else { return }
+        let input = recordingEngine.inputNode
+        let format = input.outputFormat(forBus: 0)
+        guard format.sampleRate > 0, format.channelCount > 0 else {
+            handleJSEvent("VOICECHAT: error microphone unavailable")
+            return
+        }
+        let request = SFSpeechAudioBufferRecognitionRequest()
+        request.shouldReportPartialResults = true
+        recognitionRequest = request
+        voiceChatText = ""
+        voiceChatLastSpeechAt = nil
+        voiceChatUtteranceStartedAt = nil
+        voiceChatDiscardingInput = false
+        recognitionTask?.cancel()
+        recognitionTask = SFSpeechRecognizer(locale: Locale(identifier: "zh-CN"))?.recognitionTask(with: request) { [weak self] result, error in
+            DispatchQueue.main.async {
+                guard let self, self.isVoiceChatListening else { return }
+                if let result {
+                    let text = result.bestTranscription.formattedString.trimmingCharacters(in: .whitespacesAndNewlines)
+                    if self.voiceChatCanProcessInput() {
+                        if !text.isEmpty, text != self.voiceChatText {
+                            self.voiceChatText = text
+                            self.voiceChatLastSpeechAt = Date()
+                            if self.voiceChatUtteranceStartedAt == nil { self.voiceChatUtteranceStartedAt = Date() }
+                        }
+                    } else {
+                        self.resetVoiceChatUtterance()
+                        self.voiceChatDiscardingInput = true
+                    }
+                    if result.isFinal {
+                        self.finishVoiceChatUtterance()
+                        return
+                    }
+                }
+                if let error {
+                    self.handleJSEvent("VOICECHAT: recognition error \(error.localizedDescription)")
+                    self.restartVoiceChatRecognition(after: 0.5)
+                }
+            }
+        }
+        input.removeTap(onBus: 0)
+        input.installTap(onBus: 0, bufferSize: 1024, format: format) { [weak self] buffer, _ in
+            self?.recognitionRequest?.append(buffer)
+        }
+        do {
+            recordingEngine.prepare()
+            try recordingEngine.start()
+            isVoiceChatListening = true
+            voiceChatSilenceTimer?.invalidate()
+            voiceChatSilenceTimer = Timer.scheduledTimer(withTimeInterval: 0.25, repeats: true) { [weak self] _ in
+                self?.checkVoiceChatSilence()
+            }
+            if showListeningHint { showBubble("🎧 在听呢...") }
+            handleJSEvent("VOICECHAT: started")
+        } catch {
+            input.removeTap(onBus: 0)
+            recognitionTask?.cancel()
+            recognitionTask = nil
+            recognitionRequest = nil
+            handleJSEvent("VOICECHAT: error start failed \(error.localizedDescription)")
+        }
+    }
+
+    private func voiceChatCanProcessInput() -> Bool {
+        let isSpeaking = speechProcess != nil || speechPlayer != nil || speechSynthesizer.isSpeaking
+        return voiceChatEnabled() && !isAIReplying && !isSpeaking && !isUserDragging && !isInputOpen && !isRecording
+    }
+
+    private func checkVoiceChatSilence() {
+        guard isVoiceChatListening else { return }
+        guard voiceChatCanProcessInput() else {
+            resetVoiceChatUtterance()
+            voiceChatDiscardingInput = true
+            return
+        }
+        if voiceChatDiscardingInput {
+            restartVoiceChatRecognition(after: 0.1)
+            return
+        }
+        let now = Date()
+        if let last = voiceChatLastSpeechAt, now.timeIntervalSince(last) >= 2.2 {
+            finishVoiceChatUtterance()
+        } else if let started = voiceChatUtteranceStartedAt, now.timeIntervalSince(started) >= 15.0 {
+            finishVoiceChatUtterance()
+        }
+    }
+
+    private func resetVoiceChatUtterance() {
+        voiceChatText = ""
+        voiceChatLastSpeechAt = nil
+        voiceChatUtteranceStartedAt = nil
+    }
+
+    private func finishVoiceChatUtterance() {
+        let text = voiceChatText.trimmingCharacters(in: .whitespacesAndNewlines)
+        resetVoiceChatUtterance()
+        guard !text.isEmpty, voiceChatCanProcessInput() else { return }
+        handleJSEvent("VOICECHAT: recognized text=\(text)")
+        handleJSEvent("VOICECHAT: sent-to-AI")
+        handleJSEvent("VOICECHAT: reply started")
+        isVoiceChatConversationActive = true
+        askHermes(text)
+        monitorVoiceChatReplyCompletion()
+        // 给每句话一个全新的识别请求，避免长时间任务被 Speech 框架自动终止。
+        restartVoiceChatRecognition(after: 0.15)
+    }
+
+    private func monitorVoiceChatReplyCompletion() {
+        voiceChatReplyMonitor?.invalidate()
+        voiceChatReplyMonitor = Timer.scheduledTimer(withTimeInterval: 0.25, repeats: true) { [weak self] timer in
+            guard let self else { timer.invalidate(); return }
+            let isSpeaking = self.speechProcess != nil || self.speechPlayer != nil || self.speechSynthesizer.isSpeaking
+            if self.isVoiceChatConversationActive && !self.isAIReplying && !isSpeaking {
+                self.isVoiceChatConversationActive = false
+                timer.invalidate()
+                self.voiceChatReplyMonitor = nil
+                self.handleJSEvent("VOICECHAT: reply finished")
+                self.restartVoiceChatRecognition(after: 0.1)
+            }
+        }
+    }
+
+    private func restartVoiceChatRecognition(after delay: TimeInterval) {
+        guard voiceChatEnabled(), !isRecording else { return }
+        stopVoiceChatRecognitionSession(logStopped: false)
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
+            self?.beginVoiceChatRecognition()
+        }
+    }
+
+    private func stopVoiceChatRecognitionSession(logStopped: Bool) {
+        guard isVoiceChatListening || recognitionRequest != nil else { return }
+        isVoiceChatListening = false
+        voiceChatSilenceTimer?.invalidate()
+        voiceChatSilenceTimer = nil
+        recordingEngine.stop()
+        recordingEngine.inputNode.removeTap(onBus: 0)
+        recognitionRequest?.endAudio()
+        recognitionTask?.cancel()
+        recognitionTask = nil
+        recognitionRequest = nil
+        resetVoiceChatUtterance()
+        if logStopped { handleJSEvent("VOICECHAT: stopped") }
+    }
+
+    private func stopVoiceChatListener() {
+        stopVoiceChatRecognitionSession(logStopped: true)
+        voiceChatReplyMonitor?.invalidate()
+        voiceChatReplyMonitor = nil
+        isVoiceChatConversationActive = false
+    }
+
+    private func playRecordedVoiceWithPitch() {
+        let url = URL(fileURLWithPath: "/tmp/pet_user_audio.caf")
+        guard let file = try? AVAudioFile(forReading: url) else {
+            showBubble("没有听清呢～")
+            return
+        }
+        let engine = AVAudioEngine()
+        let player = AVAudioPlayerNode()
+        let pitch = AVAudioUnitTimePitch()
+        pitch.pitch = 300 // +3 semitones
+        engine.attach(player)
+        engine.attach(pitch)
+        engine.connect(player, to: pitch, format: file.processingFormat)
+        engine.connect(pitch, to: engine.mainMixerNode, format: file.processingFormat)
+        player.scheduleFile(file, at: nil) { [weak self] in
+            DispatchQueue.main.async { self?.voicePlaybackEngine = nil }
+        }
+        do {
+            try engine.start()
+            voicePlaybackEngine = engine
+            playReaction(emotion: "开心", motion: "talk")
+            player.play()
+            handleJSEvent("VOICE_REPEAT: pitched audio fallback")
+        } catch {
+            showBubble("复读失败了～")
+            handleJSEvent("VOICE_REPEAT: playback failed \(error.localizedDescription)")
+        }
+    }
+
+    func dismissInputBar() {
+        inputBar?.removeFromSuperview()
+        inputBar = nil
+        isInputOpen = false
     }
 
     // 调 AI (自定义 API 优先, 否则 Hermes gateway)
     func askHermes(_ text: String) {
+        markActivity()
+        isAIReplying = true
         let cfg = loadConfig()
         // 决定 baseURL / key / model
         var baseURL = cfg.apiBaseURL
@@ -366,6 +898,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
         if baseURL.isEmpty {
             // 内置 Hermes gateway
             guard let key = readGatewayKey() else {
+                isAIReplying = false
                 showBubble("⚠️ 未找到 API_SERVER_KEY (检查 ~/.hermes/.env)")
                 return
             }
@@ -376,6 +909,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
         // 规范化 baseURL: 去掉末尾 /
         if baseURL.hasSuffix("/") { baseURL = String(baseURL.dropLast()) }
         guard let url = URL(string: baseURL + "/chat/completions") else {
+            isAIReplying = false
             showBubble("⚠️ API 地址无效: \(baseURL)")
             return
         }
@@ -387,7 +921,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
             req.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
         }
         let systemPrompt = cfg.systemPrompt.isEmpty ? "你是一只可爱的鲸鱼娘桌宠, 用简短可爱的语气回答, 不超过80字, 可以带颜文字。" : cfg.systemPrompt
-        let fullPrompt = systemPrompt + "\n\n【情绪/动作协议】回复时优先调用工具：set_emotion 设置情绪（可选：开心、悲伤、生气、害羞、惊讶、疑惑、疲惫、调皮、无语、心动、星星眼、爱心眼、晕、哭、发呆），play_motion 播放身体动作（可选：待机、撒娇、自拍、简单自拍、番茄酱、开盖、吹泡泡、喷水）。如果当前环境无法调用工具，则改用文本标签格式：回复以 [情绪词] 开头（如 [开心]），需要动作时在任意位置加 [动作:xxx]（如 [动作:自拍]）。正文只写简短可爱的中文，不要输出工具名或标签之外的内容。例如：[开心][动作:自拍] 今天好开心呀~"
+        let fullPrompt = systemPrompt + """
+
+        【可用的工具】
+        - set_emotion(emotion): 情绪表情，可选值：开心、悲伤、生气、害羞、惊讶、疑惑、疲惫、调皮、无语、心动、星星眼、爱心眼、晕、哭、发呆（每次回复必须调用一次，选最贴切的）
+        - play_motion(motion): 身体动作，可选值：待机、撒娇、自拍、简单自拍、番茄酱、开盖、吹泡泡、喷水、爬动（只在需要明显身体动作时调用）
+        - move_window(x, y): 移动窗口，x/y 为 0-100 百分比（需要走动/找我时调用；“找我”可用 direction 参数，移动到用户常驻位置，例如右下角或屏幕中央附近）
+
+        【规则】回复正文只写简短可爱的中文（不超过 80 字），不要输出工具名、参数或标签。每次回复至少调用 set_emotion；需要身体动作时调用 play_motion；想走动或找主人时调用 move_window。
+        如果环境不能调用工具（例如 API 不返回 tool_calls），你必须使用文本标签来表达，并且标签要写在回复正文里：
+        - 情绪标签 [情绪] 放在回复最开头（必须，例如 [开心]、[害羞]、[生气]）
+        - 动作标签 [动作:xxx] 放在正文任意位置（可选，例如 [动作:撒娇]、[动作:自拍]、[动作:爬动]；当你想做明显的身体动作/卖萌/展示时才加，不要每条都加）
+        - 移动标签 [移动:xx%yy%] 或 [移动:找我] 放在正文任意位置（可选）
+        注意：即使能用工具，正文里也不要出现任何工具名/参数/标签字样；标签只在不能调用工具时使用。
+        """
         let tools: [[String: Any]] = [
             [
                 "type": "function",
@@ -400,7 +947,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
                             "motion": [
                                 "type": "string",
                                 "description": "要播放的身体动作",
-                                "enum": ["待机", "撒娇", "自拍", "简单自拍", "番茄酱", "开盖", "吹泡泡", "喷水"]
+                                "enum": ["待机", "撒娇", "自拍", "简单自拍", "番茄酱", "开盖", "吹泡泡", "喷水", "爬动"]
                             ]
                         ],
                         "required": ["motion"],
@@ -426,6 +973,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
                         "additionalProperties": false
                     ] as [String: Any]
                 ] as [String: Any]
+            ],
+            [
+                "type": "function",
+                "function": [
+                    "name": "move_window",
+                    "description": "移动鲸鱼娘窗口到屏幕某个位置。也可用 direction 指定上、下、左、右、中间或找我。",
+                    "parameters": [
+                        "type": "object",
+                        "properties": [
+                            "x": ["type": "integer", "minimum": 0, "maximum": 100, "description": "屏幕横向位置百分比（0=最左，100=最右）"],
+                            "y": ["type": "integer", "minimum": 0, "maximum": 100, "description": "屏幕纵向位置百分比（0=最上，100=最下）"],
+                            "direction": ["type": "string", "enum": ["上", "下", "左", "右", "中间", "找我"], "description": "没有坐标时使用的方向别名"]
+                        ],
+                        "required": ["x", "y"],
+                        "additionalProperties": false
+                    ] as [String: Any]
+                ] as [String: Any]
             ]
         ]
         let body: [String: Any] = [
@@ -443,6 +1007,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
         URLSession.shared.dataTask(with: req) { [weak self] data, resp, err in
             DispatchQueue.main.async {
                 guard let self else { return }
+                self.isAIReplying = false
+                self.markActivity()
                 if let err {
                     self.showBubble("⚠️ 网络错误: \(err.localizedDescription)")
                     return
@@ -459,6 +1025,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
                 var text = (msg["content"] as? String) ?? ""
                 var emotion: String? = nil
                 var motion: String? = nil
+                var moveTarget: (Int, Int)? = nil
                 let motionAliases = [
                     "idle": "idle", "待机": "idle",
                     "aidale": "aidale", "撒娇": "aidale",
@@ -467,7 +1034,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
                     "ketchup": "ketchup", "番茄酱": "ketchup", "挤番茄酱": "ketchup",
                     "openlid": "openLid", "开盖": "openLid",
                     "bubble": "bubble", "吹泡泡": "bubble",
-                    "splash": "splash", "喷水": "splash"
+                    "splash": "splash", "喷水": "splash",
+                    "crawl": "crawl", "爬动": "crawl", "游动": "crawl",
+                    "talk": "talk", "说话": "talk", "讲话": "talk"
                 ]
                 let validEmotions: Set<String> = ["开心", "悲伤", "生气", "害羞", "惊讶", "疑惑", "疲惫", "调皮", "无语", "心动", "星星眼", "爱心眼", "晕", "哭", "发呆"]
                 let toolCalls = msg["tool_calls"] as? [[String: Any]] ?? []
@@ -479,6 +1048,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
                         continue
                     }
                     print("TOOL_CALL: \(name) \(arguments)")
+                    self.markActivity()
                     guard let argumentData = arguments.data(using: .utf8),
                           let args = try? JSONSerialization.jsonObject(with: argumentData) as? [String: Any] else {
                         print("TOOL_RESULT: \(name) invalid JSON arguments")
@@ -500,30 +1070,64 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
                         } else {
                             print("TOOL_RESULT: play_motion rejected \(args)")
                         }
+                    case "move_window":
+                        if let target = self.moveTarget(from: args) {
+                            moveTarget = target
+                            print("TOOL_RESULT: move_window accepted \(target.0)% \(target.1)%")
+                        } else {
+                            print("TOOL_RESULT: move_window rejected \(args)")
+                        }
                     default:
                         print("TOOL_RESULT: unsupported tool \(name)")
                     }
                 }
 
+                // 支持多个标签: 依次收集 [移动] / [动作:xxx] / [情绪] 并按顺序触发
+                var pendingMotions: [String] = []
+                var pendingEmotions: [String] = []
+                var pendingMove: (Int, Int)? = nil
+                if let moveRegex = try? NSRegularExpression(pattern: #"[\[［]\s*移动\s*[:：]\s*([^\]］]+?)\s*[\]］]"#) {
+                    let all = moveRegex.matches(in: text, range: NSRange(text.startIndex..., in: text))
+                    for m in all {
+                        if let vr = Range(m.range(at: 1), in: text) {
+                            let value = String(text[vr]).trimmingCharacters(in: .whitespacesAndNewlines)
+                            if toolCalls.isEmpty, let t = self.moveTarget(fromTag: value) { pendingMove = t }
+                        }
+                    }
+                    text = moveRegex.stringByReplacingMatches(in: text, range: NSRange(text.startIndex..., in: text), withTemplate: " ")
+                }
+
                 // 兼容不支持 tools 的旧/自定义接口：没有 tool_calls 时沿用标签取值；
                 // 若已有 tool_calls 但正文误带标签，也会清除，避免显示或朗读工具语法。
-                if let motionRegex = try? NSRegularExpression(pattern: #"[\[［]\s*(?:动作|motion)\s*[:：]\s*([^\]］]+?)\s*[\]］]"#, options: [.caseInsensitive]),
-                   let match = motionRegex.firstMatch(in: text, range: NSRange(text.startIndex..., in: text)),
-                   let valueRange = Range(match.range(at: 1), in: text) {
-                    let value = String(text[valueRange]).trimmingCharacters(in: .whitespacesAndNewlines)
-                    if toolCalls.isEmpty { motion = motionAliases[value.lowercased()] }
+                if let motionRegex = try? NSRegularExpression(pattern: #"[\[［]\s*(?:动作|motion)\s*[:：]\s*([^\]］]+?)\s*[\]］]"#, options: [.caseInsensitive]) {
+                    let all = motionRegex.matches(in: text, range: NSRange(text.startIndex..., in: text))
+                    for m in all {
+                        if let vr = Range(m.range(at: 1), in: text) {
+                            let value = String(text[vr]).trimmingCharacters(in: .whitespacesAndNewlines)
+                            if let g = motionAliases[value.lowercased()] { pendingMotions.append(g) }
+                        }
+                    }
                     text = motionRegex.stringByReplacingMatches(in: text, range: NSRange(text.startIndex..., in: text), withTemplate: " ")
                 }
-                // 动作标签可在最前面；先移除后，仍可识别紧随其后的情绪标签。
-                if let emotionRegex = try? NSRegularExpression(pattern: #"^\s*[\[［]\s*([^\]］:：]{1,6}?)\s*[\]］]"#),
-                   let match = emotionRegex.firstMatch(in: text, range: NSRange(text.startIndex..., in: text)),
-                   let valueRange = Range(match.range(at: 1), in: text) {
-                    let value = String(text[valueRange]).trimmingCharacters(in: .whitespacesAndNewlines)
-                    if validEmotions.contains(value) {
-                        if toolCalls.isEmpty { emotion = value }
-                        text = emotionRegex.stringByReplacingMatches(in: text, range: NSRange(text.startIndex..., in: text), withTemplate: "")
+                if let emotionRegex = try? NSRegularExpression(pattern: #"[\[［]\s*([^\]］:：]{1,6}?)\s*[\]］]"#) {
+                    let all = emotionRegex.matches(in: text, range: NSRange(text.startIndex..., in: text))
+                    for m in all {
+                        if let vr = Range(m.range(at: 1), in: text) {
+                            let value = String(text[vr]).trimmingCharacters(in: .whitespacesAndNewlines)
+                            if validEmotions.contains(value) { pendingEmotions.append(value) }
+                        }
                     }
+                    text = emotionRegex.stringByReplacingMatches(in: text, range: NSRange(text.startIndex..., in: text), withTemplate: "")
                 }
+                if !toolCalls.isEmpty {
+                    // tool_calls 已处理, 标签仅作清理 (不覆盖)
+                } else {
+                    motion = pendingMotions.first
+                    emotion = pendingEmotions.first
+                    moveTarget = pendingMove ?? moveTarget
+                }
+                self.pendingEmotions = pendingEmotions
+                self.pendingMotions = pendingMotions
                 text = text.trimmingCharacters(in: .whitespacesAndNewlines)
                 if let spaces = try? NSRegularExpression(pattern: #"[ \t]{2,}"#) {
                     text = spaces.stringByReplacingMatches(in: text, range: NSRange(text.startIndex..., in: text), withTemplate: " ")
@@ -541,6 +1145,32 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
                     let js = "window.__setMotion ? window.__setMotion('\(self.jsEscapedString(motion))') : 0"
                     self.webView.evaluateJavaScript(js, completionHandler: nil)
                 }
+                // 多标签依次播放: [情绪][情绪]... 或 [动作:a][动作:b]... 每隔 1.8s 播下一个
+                // (第一个已由上方 emotion/motion 立即触发, 从第 2 个开始排队)
+                var seqDelay = 1.8
+                if self.pendingEmotions.count > 1 {
+                    for (i, item) in self.pendingEmotions.enumerated() where i > 0 {
+                        DispatchQueue.main.asyncAfter(deadline: .now() + seqDelay) { [weak self] in
+                            guard let self else { return }
+                            let js = "window.__setEmotion ? window.__setEmotion('\(self.jsEscapedString(item))') : 0"
+                            self.webView.evaluateJavaScript(js, completionHandler: nil)
+                        }
+                        seqDelay += 1.8
+                    }
+                }
+                if self.pendingMotions.count > 1 {
+                    for (i, item) in self.pendingMotions.enumerated() where i > 0 {
+                        DispatchQueue.main.asyncAfter(deadline: .now() + seqDelay) { [weak self] in
+                            guard let self else { return }
+                            let js = "window.__setMotion ? window.__setMotion('\(self.jsEscapedString(item))') : 0"
+                            self.webView.evaluateJavaScript(js, completionHandler: nil)
+                        }
+                        seqDelay += 1.8
+                    }
+                }
+                if let target = moveTarget {
+                    self.moveWindow(xPercent: target.0, yPercent: target.1, reason: "MOVE_WINDOW", duration: 2.6)
+                }
                 if self.speechEnabled() {
                     self.showBubble("……")
                 } else {
@@ -555,6 +1185,154 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
         let defaults = UserDefaults.standard
         if defaults.object(forKey: "pet_speak") == nil { return true }
         return defaults.bool(forKey: "pet_speak")
+    }
+
+    func wanderEnabled() -> Bool {
+        let defaults = UserDefaults.standard
+        if defaults.object(forKey: "pet_wander") == nil { return true }
+        return defaults.bool(forKey: "pet_wander")
+    }
+
+    func markActivity() {
+        lastActivity = Date()
+    }
+
+    private func activeScreenFrame() -> NSRect {
+        let center = NSPoint(x: window.frame.midX, y: window.frame.midY)
+        return NSScreen.screens.first { NSMouseInRect(center, $0.frame, false) }?.visibleFrame
+            ?? NSScreen.main?.visibleFrame
+            ?? NSRect(x: 0, y: 0, width: 1512, height: 982)
+    }
+
+    private func moveTarget(from args: [String: Any]) -> (Int, Int)? {
+        if let x = (args["x"] as? NSNumber)?.intValue,
+           let y = (args["y"] as? NSNumber)?.intValue {
+            return (min(100, max(0, x)), min(100, max(0, y)))
+        }
+        if let direction = args["direction"] as? String {
+            return moveTarget(fromTag: direction)
+        }
+        return nil
+    }
+
+    private func moveTarget(fromTag value: String) -> (Int, Int)? {
+        let compact = value.replacingOccurrences(of: " ", with: "")
+        let aliases: [String: (Int, Int)] = [
+            "上": (50, 5), "下": (50, 95), "左": (5, 70), "右": (95, 70),
+            "中间": (50, 50), "中央": (50, 50), "找我": (85, 85)
+        ]
+        if let target = aliases[compact] { return target }
+        let pattern = #"^(\d{1,3})%?[,，\s]*(\d{1,3})%?$"#
+        guard let regex = try? NSRegularExpression(pattern: pattern),
+              let match = regex.firstMatch(in: compact, range: NSRange(compact.startIndex..., in: compact)),
+              let xr = Range(match.range(at: 1), in: compact),
+              let yr = Range(match.range(at: 2), in: compact),
+              let x = Int(compact[xr]), let y = Int(compact[yr]) else { return nil }
+        return (min(100, max(0, x)), min(100, max(0, y)))
+    }
+
+    private func moveWindow(xPercent: Int, yPercent: Int, reason: String, duration: TimeInterval) {
+        guard !isUserDragging, !isWindowAnimating else { return }
+        let crawlJS = "window.__setMotion ? window.__setMotion('crawl') : 0"
+        webView.evaluateJavaScript(crawlJS, completionHandler: nil)
+        handleJSEvent("MOTION_DURING_MOVE: crawl")
+        let visible = activeScreenFrame()
+        let frame = window.frame
+        let availableX = max(0, visible.width - frame.width)
+        let availableY = max(0, visible.height - frame.height)
+        let x = visible.minX + availableX * CGFloat(min(100, max(0, xPercent))) / 100
+        // AppKit 原点在左下；协议的 y=0 是顶部。
+        let y = visible.maxY - frame.height - availableY * CGFloat(min(100, max(0, yPercent))) / 100
+        let target = NSRect(x: x, y: y, width: frame.width, height: frame.height)
+        isWindowAnimating = true
+        let animationID = UUID()
+        windowAnimationID = animationID
+        // 分段爬行移动: 3 段小步 + 停顿, 配合 crawl 循环动作 (视觉上一步一步爬过去)
+        let steps = 3
+        let stepDuration = max(0.25, duration / Double(steps) * 0.8)
+        let pause = 0.12
+        animateWindowStep(1, steps: steps, from: frame, to: target,
+                          stepDuration: stepDuration, pause: pause, animationID: animationID)
+        handleJSEvent("\(reason): \(xPercent)% \(yPercent)% -> \(Int(x)),\(Int(y))")
+    }
+
+    private func animateWindowStep(_ step: Int, steps: Int, from start: NSRect, to target: NSRect,
+                                   stepDuration: TimeInterval, pause: TimeInterval, animationID: UUID) {
+        guard windowAnimationID == animationID else { return }
+        guard !isUserDragging else {
+            finishWindowMove(animationID: animationID)
+            return
+        }
+        guard step <= steps else {
+            finishWindowMove(animationID: animationID)
+            return
+        }
+        let t = CGFloat(step) / CGFloat(steps)
+        let intermediate = NSRect(
+            x: start.minX + (target.minX - start.minX) * t,
+            y: start.minY + (target.minY - start.minY) * t,
+            width: start.width, height: start.height
+        )
+        NSAnimationContext.runAnimationGroup { [weak self] context in
+            guard let self else { return }
+            context.duration = stepDuration
+            context.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
+            self.window.animator().setFrame(intermediate, display: true)
+        } completionHandler: { [weak self] in
+            guard let self, self.windowAnimationID == animationID else { return }
+            let continueMove = {
+                self.animateWindowStep(step + 1, steps: steps, from: start, to: target,
+                                       stepDuration: stepDuration, pause: pause, animationID: animationID)
+            }
+            if step < steps {
+                DispatchQueue.main.asyncAfter(deadline: .now() + pause, execute: continueMove)
+            } else {
+                continueMove()
+            }
+        }
+    }
+
+    private func finishWindowMove(animationID: UUID) {
+        guard windowAnimationID == animationID else { return }
+        isWindowAnimating = false
+        let idleJS = "window.__setMotion ? window.__setMotion('idle') : 0"
+        webView.evaluateJavaScript(idleJS, completionHandler: nil)
+    }
+
+    func scheduleWander() {
+        wanderTimer?.invalidate()
+        wanderTimer = Timer.scheduledTimer(withTimeInterval: Double.random(in: 6...10), repeats: false) { [weak self] _ in
+            guard let self else { return }
+            defer { self.scheduleWander() }
+            let isSpeaking = self.speechProcess != nil || self.speechPlayer != nil || self.speechSynthesizer.isSpeaking
+            // 只有待机满 3 分钟(180s)才自主移动; 有输入/输入框打开/设置面板/AI回复/拖拽/语音/动画中一律不动
+            guard self.wanderEnabled(), Date().timeIntervalSince(self.lastActivity) > 180,
+                  !self.isUserDragging, !self.isAIReplying, !self.isInputOpen, !isSpeaking, !self.isWindowAnimating else { return }
+
+            // ———— Task 3: 20% 概率用卖萌动作代替本次漫游 ————
+            if Int.random(in: 0..<5) == 0 {
+                let gestures = [
+                    ("吐舌", "bubble"), ("爱心眼", "aidale"),
+                    ("开心", "selfieQuick"), ("发呆", "openLid"), ("星星眼", "ketchup")
+                ]
+                let gesture = gestures.randomElement()!
+                self.playReaction(emotion: gesture.0, motion: gesture.1)
+                self.handleJSEvent("RANDOM_GESTURE: \(gesture.1) / \(gesture.0)")
+                self.markActivity()
+                return
+            }
+
+            let visible = self.activeScreenFrame()
+            let availableX = max(1, visible.width - self.window.frame.width)
+            let availableY = max(1, visible.height - self.window.frame.height)
+            let currentX = Int(((self.window.frame.minX - visible.minX) / availableX * 100).rounded())
+            let currentY = Int(((visible.maxY - self.window.frame.maxY) / availableY * 100).rounded())
+            let nextX = min(100, max(0, currentX + Int.random(in: -8...8)))
+            // 偏爱屏幕下方，并保持轻柔的小步移动。
+            let verticalStep = currentY < 65 ? Int.random(in: 2...8) : Int.random(in: -5...5)
+            let nextY = min(95, max(55, currentY + verticalStep))
+            self.moveWindow(xPercent: nextX, yPercent: nextY, reason: "WANDER", duration: 2.6)
+        }
     }
 
     func selectedVoice() -> String {
@@ -591,11 +1369,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
             NotificationCenter.default.removeObserver(observer)
             speechEndObserver = nil
         }
+        if let observer = speechFailureObserver {
+            NotificationCenter.default.removeObserver(observer)
+            speechFailureObserver = nil
+        }
         if let path = speechOutputPath {
             try? FileManager.default.removeItem(atPath: path)
             speechOutputPath = nil
         }
         speechSynthesizer.stopSpeaking(at: .immediate)
+        stopTalkingMotion()
+    }
+
+    func startTalkingMotion() {
+        let js = "window.__setMotion ? window.__setMotion('talk') : 0"
+        webView.evaluateJavaScript(js, completionHandler: nil)
+        handleJSEvent("TALK_DURING_SPEECH: talk")
+    }
+
+    func stopTalkingMotion() {
+        let js = "window.__setMotion ? window.__setMotion('idle') : 0"
+        webView.evaluateJavaScript(js, completionHandler: nil)
     }
 
     // 只清理送入 TTS 的文本；气泡始终使用未经修改的原文。
@@ -651,7 +1445,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
         text.unicodeScalars.contains { CharacterSet.alphanumerics.contains($0) }
     }
 
-    func speak(_ text: String, emotion: String? = nil) {
+    func speak(_ text: String, emotion: String? = nil, prosodyOverride: SpeechProsody? = nil) {
         guard speechEnabled(), !text.isEmpty else { return }
         stopSpeech()
         let speechText = cleanSpeechText(text)
@@ -663,19 +1457,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
         }
         let voice = selectedVoice()
         if voice == "system" {
-            speakWithSystem(speechText, emotion: emotion, displayText: text)
+            speakWithSystem(speechText, emotion: emotion, displayText: text, prosodyOverride: prosodyOverride)
             return
         }
 
         guard let helper = ttsHelperPath() else {
             handleJSEvent("TTS_FALLBACK: helper not found")
-            speakWithSystem(speechText, emotion: emotion, displayText: text)
+            speakWithSystem(speechText, emotion: emotion, displayText: text, prosodyOverride: prosodyOverride)
             return
         }
         let requestID = UUID()
         speechRequestID = requestID
         let output = "/tmp/whalepet_tts_\(requestID.uuidString).mp3"
-        let params = prosody(for: emotion)
+        let params = prosodyOverride ?? prosody(for: emotion)
         let process = Process()
         let environment = ProcessInfo.processInfo.environment
         let venv = environment["TTS_VENV"] ?? "/tmp/ttsvenv"
@@ -728,9 +1522,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
                         NotificationCenter.default.removeObserver(observer)
                     }
                     self.speechEndObserver = nil
+                    if let observer = self.speechFailureObserver {
+                        NotificationCenter.default.removeObserver(observer)
+                    }
+                    self.speechFailureObserver = nil
                     self.speechOutputPath = nil
                     try? FileManager.default.removeItem(atPath: output)
+                    self.stopTalkingMotion()
                 }
+                self.speechFailureObserver = NotificationCenter.default.addObserver(
+                    forName: .AVPlayerItemFailedToPlayToEndTime,
+                    object: item,
+                    queue: .main
+                ) { [weak self] note in
+                    guard let self, self.speechRequestID == requestID else { return }
+                    self.handleJSEvent("TTS_PLAYBACK_ERROR: \(String(describing: note.userInfo))")
+                    self.stopSpeech()
+                }
+                self.startTalkingMotion()
                 self.speechPlayer?.play()
                 // 字音同步: 语音开始的同时启动打字机, 文字按音频时长均匀打出
                 let typeJs: String
@@ -764,7 +1573,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
         return candidates.first { FileManager.default.fileExists(atPath: $0) }
     }
 
-    func speakWithSystem(_ text: String, emotion: String?, displayText: String? = nil) {
+    func speakWithSystem(_ text: String, emotion: String?, displayText: String? = nil,
+                         prosodyOverride: SpeechProsody? = nil) {
         let speechText = cleanSpeechText(text)
         let bubbleText = displayText ?? text
         guard containsSpeechContent(speechText) else {
@@ -778,13 +1588,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
         utterance.voice = voices.first { voice in
             names.contains { voice.name.localizedCaseInsensitiveContains($0) }
         } ?? voices.first ?? AVSpeechSynthesisVoice(language: "zh-CN")
-        let params = prosody(for: emotion)
+        let params = prosodyOverride ?? prosody(for: emotion)
         let ratePercent = Float(params.rate.dropLast()) ?? 0
         utterance.rate = min(0.65, max(0.35, 0.5 * (1 + ratePercent / 100)))
         let volumePercent = Float(params.volume.dropLast()) ?? 0
         utterance.volume = min(1, max(0, 0.9 * (1 + volumePercent / 100)))
         let pitchHz = Float(params.pitch.dropLast(2)) ?? 0
         utterance.pitchMultiplier = min(2, max(0.5, 1 + pitchHz / 50))
+        startTalkingMotion()
         speechSynthesizer.speak(utterance)
         let voiceName = utterance.voice?.name ?? "zh-CN default"
         handleJSEvent("SPEAK_SYSTEM: voice=\(voiceName) emotion=\(emotion ?? "default") chars=\(speechText.count)")
@@ -793,6 +1604,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
         let estDuration = Double(Array(speechText).count) * estMsPerChar
         let typeJs = "window.__showBubble ? window.__showBubble('\(self.jsEscapedString(bubbleText))', \(Int(estDuration))) : 0"
         self.webView.evaluateJavaScript(typeJs, completionHandler: nil)
+    }
+
+    func speechSynthesizer(_ synthesizer: AVSpeechSynthesizer, didFinish utterance: AVSpeechUtterance) {
+        stopTalkingMotion()
+    }
+
+    func speechSynthesizer(_ synthesizer: AVSpeechSynthesizer, didCancel utterance: AVSpeechUtterance) {
+        stopTalkingMotion()
     }
 
     // 读 ~/.hermes/.env 里的 API_SERVER_KEY
@@ -828,8 +1647,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
     }
 
     // 页面里显示气泡
-    func showBubble(_ text: String) {
-        let js = "window.__showBubble ? window.__showBubble('\(jsEscapedString(text))') : 0"
+    func showBubble(_ text: String, durationMs: Int = 0) {
+        let js = "window.__showBubble ? window.__showBubble('\(jsEscapedString(text))', \(durationMs)) : 0"
         webView.evaluateJavaScript(js, completionHandler: nil)
     }
 
@@ -837,6 +1656,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
 
     // 右键/菜单: 完整设置面板 (大小 + AI API + 提示词)
     @objc func openSettings() {
+        markActivity()
+        isInputOpen = true   // 设置面板打开 = 操作中
+        if isVoiceChatListening { stopVoiceChatListener() }
         let cfg = loadConfig()
         let alert = NSAlert()
         alert.messageText = "⚙️ 桌宠设置"
@@ -845,8 +1667,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
         alert.addButton(withTitle: "取消")
 
         // 垂直排列的输入区
-        let box = NSView(frame: NSRect(x: 0, y: 0, width: 380, height: 400))
-        var y: CGFloat = 380
+        let box = NSView(frame: NSRect(x: 0, y: 0, width: 380, height: 464))
+        var y: CGFloat = 444
 
         func addLabel(_ text: String) {
             let l = NSTextField(labelWithString: text)
@@ -877,6 +1699,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
         speakCheck.frame = NSRect(x: 0, y: y - 20, width: 160, height: 22)
         speakCheck.state = speechEnabled() ? .on : .off
         box.addSubview(speakCheck)
+        y -= 32
+
+        let wanderCheck = NSButton(checkboxWithTitle: "自主移动", target: nil, action: nil)
+        wanderCheck.frame = NSRect(x: 0, y: y - 20, width: 160, height: 22)
+        wanderCheck.state = wanderEnabled() ? .on : .off
+        box.addSubview(wanderCheck)
+        y -= 32
+
+        let voiceChatCheck = NSButton(checkboxWithTitle: "语音对话", target: nil, action: nil)
+        voiceChatCheck.frame = NSRect(x: 0, y: y - 20, width: 160, height: 22)
+        voiceChatCheck.state = voiceChatEnabled() ? .on : .off
+        box.addSubview(voiceChatCheck)
         y -= 32
 
         addLabel("语音音色")
@@ -916,7 +1750,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
         alert.window.collectionBehavior = [.canJoinAllSpaces, .stationary]
         NSApp.activate(ignoringOtherApps: true)
         alert.beginSheetModal(for: window) { [weak self] resp in
-            guard let self, resp == .alertFirstButtonReturn else { return }
+            guard let self else { return }
+            self.isInputOpen = false   // 设置面板关闭
+            guard resp == .alertFirstButtonReturn else {
+                if self.voiceChatEnabled() { self.startVoiceChatListener() }
+                return
+            }
             // 保存
             let scale = pop.indexOfSelectedItem + 1
             var cfg = self.loadConfig()
@@ -926,10 +1765,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
             cfg.systemPrompt = promptField.string
             self.saveConfig(cfg)
             UserDefaults.standard.set(speakCheck.state == .on, forKey: "pet_speak")
+            UserDefaults.standard.set(wanderCheck.state == .on, forKey: "pet_wander")
+            UserDefaults.standard.set(voiceChatCheck.state == .on, forKey: "pet_voiceChat")
+            if voiceChatCheck.state == .on {
+                self.startVoiceChatListener()
+            } else {
+                self.stopVoiceChatListener()
+            }
             let voiceIndex = max(0, voicePop.indexOfSelectedItem)
             UserDefaults.standard.set(self.edgeVoiceChoices[voiceIndex].id, forKey: "pet_voice")
             if speakCheck.state != .on { self.stopSpeech() }
-            self.handleJSEvent("SETTINGS_SAVED scale=x\(scale) voice=\(self.edgeVoiceChoices[voiceIndex].id)")
+            self.handleJSEvent("SETTINGS_SAVED scale=x\(scale) voice=\(self.edgeVoiceChoices[voiceIndex].id) wander=\(wanderCheck.state == .on) voiceChat=\(voiceChatCheck.state == .on)")
             // sheet 关闭后再改窗口尺寸 (sheet 期间改 frame 会导致窗口消失)
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
                 // 确保窗口可见
@@ -1025,6 +1871,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
                     let js = "window.__setMotion ? window.__setMotion('\(motionGroup)') : 0"
                     self.webView.evaluateJavaScript(js, completionHandler: nil)
                     self.handleJSEvent("DEBUG_MOTION: \(motionGroup)")
+                }
+            }
+            // 调试: 监听 /tmp/pet_move_cmd 文件, 内容为 "x% y%" -> moveWindow (触发 crawl 爬动)
+            let movePath = "/tmp/pet_move_cmd"
+            if let moveTxt = try? String(contentsOfFile: movePath, encoding: .utf8) {
+                let moveVal = moveTxt.trimmingCharacters(in: .whitespacesAndNewlines)
+                if !moveVal.isEmpty, let target = self.moveTarget(fromTag: moveVal) {
+                    try? FileManager.default.removeItem(atPath: movePath)
+                    self.moveWindow(xPercent: target.0, yPercent: target.1, reason: "DEBUG_MOVE", duration: 2.6)
                 }
             }
             let path = "/tmp/pet_scale_cmd"

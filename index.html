@@ -251,7 +251,7 @@ html, body {
   }
   const MOTION_GROUPS = new Set([
     'idle', 'aidale', 'selfie', 'selfieQuick',
-    'ketchup', 'openLid', 'bubble', 'splash'
+    'ketchup', 'openLid', 'bubble', 'splash', 'crawl', 'talk'
   ])
   window.__setMotion = function(group) {
     if (!MOTION_GROUPS.has(group)) {
@@ -289,6 +289,18 @@ html, body {
       } catch(e) {
         console.error('emotion motion error:', e)
       }
+    }
+  }
+  // Swift 拖动结束后恢复模型的默认表情，不额外触发动作。
+  window.__resetExpression = function() {
+    if (!model) return
+    try {
+      const manager = model.internalModel && model.internalModel.motionManager
+      const expressionManager = manager && manager.expressionManager
+      if (expressionManager && expressionManager.resetExpression) expressionManager.resetExpression()
+      console.log('expression: reset')
+    } catch(e) {
+      console.error('expression reset error:', e)
     }
   }
 
