@@ -940,8 +940,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
         - set_emotion(emotion): 情绪表情，可选值：开心、悲伤、生气、害羞、惊讶、疑惑、疲惫、调皮、无语、心动、星星眼、爱心眼、晕、哭、发呆（每次回复必须调用一次，选最贴切的）
         - play_motion(motion): 身体动作，可选值：待机、撒娇、自拍、简单自拍、番茄酱、开盖、吹泡泡、喷水、爬动（只在需要明显身体动作时调用）
         - move_window(x, y): 移动窗口，x/y 为 0-100 百分比（需要走动/找我时调用；“找我”可用 direction 参数，移动到用户常驻位置，例如右下角或屏幕中央附近）
+        - open_chat(): 弹出文本输入框让主人打字对话（主人要求打字/打开输入框时调用）
+        - open_settings(): 打开设置面板（主人要改配置/API/大小/音色/开关时调用）
+        - set_scale(scale): 调整大小倍率 1-5（主人说变大/变小/放大/缩小时调用）
 
-        【规则】回复正文只写简短可爱的中文（不超过 80 字），不要输出工具名、参数或标签。每次回复至少调用 set_emotion；需要身体动作时调用 play_motion；想走动或找主人时调用 move_window。
+        【规则】回复正文只写简短可爱的中文（不超过 80 字），不要输出工具名、参数或标签。每次回复至少调用 set_emotion；需要身体动作时调用 play_motion；想走动或找主人时调用 move_window；主人明确要求打开输入框/设置/改大小时调用对应工具。
         如果环境不能调用工具（例如 API 不返回 tool_calls），你必须使用文本标签来表达，并且标签要写在回复正文里：
         - 情绪标签 [情绪] 放在回复最开头（必须，例如 [开心]、[害羞]、[生气]）
         - 动作标签 [动作:xxx] 放在正文任意位置（可选，例如 [动作:撒娇]、[动作:自拍]、[动作:爬动]；当你想做明显的身体动作/卖萌/展示时才加，不要每条都加）
@@ -1000,6 +1003,47 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
                             "direction": ["type": "string", "enum": ["上", "下", "左", "右", "中间", "找我"], "description": "没有坐标时使用的方向别名"]
                         ],
                         "required": ["x", "y"],
+                        "additionalProperties": false
+                    ] as [String: Any]
+                ] as [String: Any]
+            ],
+            [
+                "type": "function",
+                "function": [
+                    "name": "open_chat",
+                    "description": "弹出文本对话输入框，让主人打字与鲸鱼娘聊天。当主人明确要求打字对话、或主人说'打开输入框/对话框'时调用。",
+                    "parameters": [
+                        "type": "object",
+                        "properties": [:],
+                        "required": [],
+                        "additionalProperties": false
+                    ] as [String: Any]
+                ] as [String: Any]
+            ],
+            [
+                "type": "function",
+                "function": [
+                    "name": "open_settings",
+                    "description": "打开桌宠设置面板（API 地址/Key/模型/提示词/大小倍率/语音/自主移动/语音对话开关）。当主人要求修改配置、设置、大小、音色、API 时调用。",
+                    "parameters": [
+                        "type": "object",
+                        "properties": [:],
+                        "required": [],
+                        "additionalProperties": false
+                    ] as [String: Any]
+                ] as [String: Any]
+            ],
+            [
+                "type": "function",
+                "function": [
+                    "name": "set_scale",
+                    "description": "调整鲸鱼娘窗口大小倍率（1-5 倍）。当主人要求变大/变小/放大/缩小鲸鱼娘时调用。",
+                    "parameters": [
+                        "type": "object",
+                        "properties": [
+                            "scale": ["type": "integer", "minimum": 1, "maximum": 5, "description": "大小倍率 1-5（1=最小，5=最大）"]
+                        ],
+                        "required": ["scale"],
                         "additionalProperties": false
                     ] as [String: Any]
                 ] as [String: Any]
@@ -1089,6 +1133,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
                             print("TOOL_RESULT: move_window accepted \(target.0)% \(target.1)%")
                         } else {
                             print("TOOL_RESULT: move_window rejected \(args)")
+                        }
+                    case "open_chat":
+                        print("TOOL_RESULT: open_chat called")
+                        self.startChat(playGreeting: false)
+                    case "open_settings":
+                        print("TOOL_RESULT: open_settings called")
+                        self.openSettings()
+                    case "set_scale":
+                        if let scale = args["scale"] as? Int, (1...5).contains(scale) {
+                            print("TOOL_RESULT: set_scale accepted \(scale)")
+                            self.applyScale(scale)
+                            self.showBubble("✅ 已调整为 x\(scale) 大小")
+                        } else {
+                            print("TOOL_RESULT: set_scale rejected \(args)")
                         }
                     default:
                         print("TOOL_RESULT: unsupported tool \(name)")
