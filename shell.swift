@@ -504,6 +504,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
             self?.dismissInputBar()
             let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
             guard !trimmed.isEmpty else { return }
+            self?.showBubble("你说: " + trimmed)
             self?.askHermes(trimmed)
         }
         bar.onCancel = { [weak self] in
@@ -758,6 +759,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
         let text = voiceChatText.trimmingCharacters(in: .whitespacesAndNewlines)
         resetVoiceChatUtterance()
         guard !text.isEmpty, voiceChatCanProcessInput(manual: voiceChatManualMode) else { return }
+        showBubble("你说: " + text)
         handleJSEvent("VOICECHAT: recognized text=\(text)")
         handleJSEvent("VOICECHAT: sent-to-AI")
         handleJSEvent("VOICECHAT: reply started")
