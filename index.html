@@ -73,6 +73,8 @@ html, body {
   Live2DModel.registerTicker(PIXI.Ticker)
 
   let model
+  let talking = false
+  let talkElapsed = 0
   // 模型原始尺寸 (scale=1 时的尺寸, 固定值)
   // 注意: model.width 是"显示宽度", 会随 scale 变化, 不能用来算 scale (会形成反馈循环导致模型忽大忽小)
   let MW = 0
@@ -117,6 +119,16 @@ html, body {
     MW = initialBounds.width
     MH = initialBounds.height
     app.stage.addChild(model)
+    // talk.motion3.json uses raw time/value pairs instead of Cubism's typed
+    // motion3 segments, so its mouth curves are ignored by the runtime parser.
+    // Apply only the mouth opening here, after motions/expressions and before
+    // the core model update; the rest of the requested motion remains intact.
+    model.internalModel.on('beforeModelUpdate', () => {
+      if (!talking) return
+      talkElapsed += app.ticker.deltaMS / 1000
+      const mouthOpen = 0.2 + 0.8 * Math.abs(Math.sin(talkElapsed * Math.PI * 4.5))
+      model.internalModel.coreModel.setParameterValueById('ParamMouthOpenY', mouthOpen)
+    })
     console.log('LOCAL_BOUNDS: x=' + modelLocalBounds.x.toFixed(1)
       + ' y=' + modelLocalBounds.y.toFixed(1)
       + ' w=' + MW.toFixed(1) + ' h=' + MH.toFixed(1))
@@ -262,6 +274,8 @@ html, body {
       console.error('motion model not ready:', group)
       return
     }
+    talking = group === 'talk'
+    if (talking) talkElapsed = 0
     try {
       model.motion(group, 0, 3)  // 3 = FORCE 优先级
       console.log('set motion:', group)
