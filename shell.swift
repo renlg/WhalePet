@@ -299,6 +299,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
     private var isVoiceChatConversationActive = false
     private var voiceChatDiscardingInput = false
     private var voiceChatManualMode = false   // 🎤 手动模式 (由输入框按钮触发)
+    private var voiceChatSessionGeneration = 0   // 会话代数: 停止/失败时 +1, 过期延迟重启自动作废
     var wanderTimer: Timer?
     var lastActivity = Date()
     var isUserDragging = false
@@ -602,7 +603,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
                             self.handleJSEvent("VOICECHAT: speech denied")
                             return
                         }
-                        self.voiceChatManualMode = true
                         self.beginVoiceChatRecognition(showListeningHint: true, force: true)
                     }
                 }
@@ -649,7 +649,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
         let input = recordingEngine.inputNode
         let format = input.outputFormat(forBus: 0)
         guard format.sampleRate > 0, format.channelCount > 0 else {
-            handleJSEvent("VOICECHAT: error microphone unavailable")
+            failVoiceChatStart(reason: "麦克风暂时不可用～")
             return
         }
         let request = SFSpeechAudioBufferRecognitionRequest()
@@ -694,6 +694,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
             recordingEngine.prepare()
             try recordingEngine.start()
             isVoiceChatListening = true
+            if force { voiceChatManualMode = true }   // manual 标记仅在会话真正启动后生效 (避免与常驻会话竞争)
             voiceChatSilenceTimer?.invalidate()
             voiceChatSilenceTimer = Timer.scheduledTimer(withTimeInterval: 0.25, repeats: true) { [weak self] _ in
                 self?.checkVoiceChatSilence()
@@ -706,8 +707,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
             recognitionTask?.cancel()
             recognitionTask = nil
             recognitionRequest = nil
-            handleJSEvent("VOICECHAT: error start failed \(error.localizedDescription)")
+            failVoiceChatStart(reason: "语音对话启动失败，再试一次吧～", detail: error.localizedDescription)
         }
+    }
+
+    /// 语音对话启动失败统一清理: 清 manual 标记 / 会话代数 +1 / 复位 UI / 可见提示
+    private func failVoiceChatStart(reason: String, detail: String = "") {
+        voiceChatManualMode = false
+        voiceChatSessionGeneration += 1
+        inputBar?.setListening(false)
+        showBubble(reason)
+        handleJSEvent("VOICECHAT: start failed \(detail)")
     }
 
     private func voiceChatCanProcessInput(manual: Bool = false) -> Bool {
@@ -776,15 +786,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
     private func restartVoiceChatRecognition(after delay: TimeInterval) {
         guard (voiceChatManualMode || voiceChatEnabled()), !isRecording else { return }
         let manual = voiceChatManualMode
+        let generation = voiceChatSessionGeneration
         stopVoiceChatRecognitionSession(logStopped: false)
         DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
-            self?.beginVoiceChatRecognition(force: manual)
+            guard let self, self.voiceChatSessionGeneration == generation else { return }  // 会话已作废
+            self.beginVoiceChatRecognition(force: manual)
         }
     }
 
     private func stopVoiceChatRecognitionSession(logStopped: Bool) {
         guard isVoiceChatListening || recognitionRequest != nil else { return }
         isVoiceChatListening = false
+        voiceChatSessionGeneration += 1   // 作废所有未决的延迟重启
         voiceChatSilenceTimer?.invalidate()
         voiceChatSilenceTimer = nil
         recordingEngine.stop()
@@ -807,6 +820,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
     }
 
     func dismissInputBar() {
+        // 手动语音对话的 mic 控件在输入框内, 关闭输入框必须同步停止手动监听, 否则识别无限继续
+        if voiceChatManualMode, isVoiceChatListening {
+            stopVoiceChatListener()
+        }
         inputBar?.removeFromSuperview()
         inputBar = nil
         isInputOpen = false
