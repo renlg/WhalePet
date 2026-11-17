@@ -1682,6 +1682,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
             let f = NSTextField(frame: NSRect(x: 0, y: y - 22, width: width, height: 24))
             f.stringValue = text
             f.placeholderString = placeholder
+            f.isSelectable = true   // 允许选中文本复制 (⌘C)
             box.addSubview(f)
             y -= 34
             return f
