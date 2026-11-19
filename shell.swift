@@ -749,8 +749,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
             return
         }
         let now = Date()
-        // 中文短句尾部 1.3s 静音即可可靠判停；原 2.2s 会在每轮固定增加近一秒等待。
-        if let last = voiceChatLastSpeechAt, now.timeIntervalSince(last) >= 1.3 {
+        // 中文短句尾部 1.0s 静音即可可靠判停；原 2.2s 每轮固定多等近一秒。
+        if let last = voiceChatLastSpeechAt, now.timeIntervalSince(last) >= 1.0 {
             finishVoiceChatUtterance()
         } else if let started = voiceChatUtteranceStartedAt, now.timeIntervalSince(started) >= 15.0 {
             finishVoiceChatUtterance()
@@ -1000,8 +1000,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
             ],
             "tools": tools,
             "tool_choice": "auto",
-            // 系统提示要求不超过 80 个中文字；保留工具参数余量，同时避免网关生成无用长尾。
-            "max_tokens": 180
+            // 系统提示要求不超过 80 个中文字；120 token 足够，回复更短则 TTS 生成更快
+            "max_tokens": 120
         ]
         req.httpBody = try? JSONSerialization.data(withJSONObject: body)
         showBubble("🐳 让我想想...")
@@ -1588,6 +1588,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
             try process.run()
             speechProcess = process
             handleJSEvent("TTS_GENERATE: voice=\(voice) emotion=\(emotion ?? "default")")
+            // edge-tts 网络合成可能很慢 (3-6s); 4 秒看门狗: 超时未产出音频 → 立即转系统本地 TTS (<1s), 口型照播
+            let watchdog = DispatchWorkItem { [weak self] in
+                guard let self, self.speechRequestID == requestID, self.speechProcess === process,
+                      self.speechPlayer == nil || self.speechPlayer?.timeControlStatus != .playing else { return }
+                self.handleJSEvent("TTS_TIMEOUT: edge-tts >4s, fallback to system TTS")
+                process.terminate()
+                self.speakWithSystem(speechText, emotion: emotion, displayText: text)
+            }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 4.0, execute: watchdog)
+            // 音频就绪 (SPEAK_EDGE 路径) 后取消看门狗
+            DispatchQueue.main.asyncAfter(deadline: .now() + 4.5) { [weak self] in
+                if self?.speechRequestID == requestID, self?.speechPlayer != nil {
+                    watchdog.cancel()
+                }
+            }
         } catch {
             handleJSEvent("TTS_FALLBACK: process launch failed: \(error.localizedDescription)")
             speakWithSystem(speechText, emotion: emotion, displayText: text)
