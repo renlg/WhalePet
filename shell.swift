@@ -339,7 +339,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
         return AIConfig(
             apiBaseURL: d.string(forKey: "pet_apiBaseURL") ?? "",
             apiKey: d.string(forKey: "pet_apiKey") ?? "",
-            model: d.string(forKey: "pet_model") ?? "grok",
+            model: d.string(forKey: "pet_model") ?? "hermes-token",
             systemPrompt: d.string(forKey: "pet_systemPrompt") ?? "你是一只可爱的鲸鱼娘桌宠, 用简短可爱的语气回答, 不超过80字, 可以带颜文字。"
         )
     }
@@ -860,7 +860,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
             }
             baseURL = "http://127.0.0.1:8642/v1"
             apiKey = key
-            if model.isEmpty { model = "grok" }
+            if model.isEmpty { model = "hermes-token" }
         }
         // 规范化 baseURL: 去掉末尾 /
         if baseURL.hasSuffix("/") { baseURL = String(baseURL.dropLast()) }
@@ -993,7 +993,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
             ]
         ]
         let body: [String: Any] = [
-            "model": model.isEmpty ? "grok" : model,
+            "model": model.isEmpty ? "hermes-token" : model,
             "messages": [
                 ["role": "system", "content": fullPrompt],
                 ["role": "user", "content": text]
@@ -1781,7 +1781,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
         y -= 34
 
         addLabel("模型名")
-        let modelField = addField(cfg.model, placeholder: "grok / gpt-4o / deepseek-chat")
+        let modelField = addField(cfg.model, placeholder: "hermes-token / grok / deepseek-chat")
 
         addLabel("角色提示词 (人设/语气)")
         let promptField = NSTextView(frame: NSRect(x: 0, y: y - 88, width: 380, height: 88))
