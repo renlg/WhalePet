@@ -120,23 +120,21 @@ html, body {
     MW = initialBounds.width
     MH = initialBounds.height
     app.stage.addChild(model)
-    // talk.motion3.json uses raw time/value pairs instead of Cubism's typed
-    // motion3 segments, so its mouth curves are ignored by the runtime parser.
-    // Apply only the mouth opening here, after motions/expressions and before
-    // the core model update; the rest of the requested motion remains intact.
+    // talk.motion3.json 提供身体/嘴型基础曲线；这里在所有 motion/expression
+    // 求值之后覆盖开口量，使口型只由明确的 speaking 状态驱动。
     model.internalModel.on('beforeModelUpdate', () => {
-      if (!talking) return
+      if (!talking) {
+        // 其他 motion/expression 也可能包含嘴部曲线；非说话状态一律强制闭嘴。
+        model.internalModel.coreModel.setParameterValueById('ParamMouthOpenY', 0)
+        return
+      }
       talkElapsed += app.ticker.deltaMS / 1000
       const mouthOpen = 0.2 + 0.8 * Math.abs(Math.sin(talkElapsed * Math.PI * 4.5))
       model.internalModel.coreModel.setParameterValueById('ParamMouthOpenY', mouthOpen)
-      // 说话动作播完 → 放行排队动作
+      // motion 文件本身 Loop=false；语音仍在继续时重启身体曲线，口型锁直到 Swift
+      // 在音频结束/取消时显式调用 __stopTalkingMotion，避免长回复中途闭嘴。
       if (talking && model.internalModel.motionManager.isFinished()) {
-        talking = false
-        if (pendingAfterTalk) {
-          const g = pendingAfterTalk
-          pendingAfterTalk = null
-          window.__setMotion(g)
-        }
+        model.motion('talk', 0, 3)
       }
     })
     console.log('LOCAL_BOUNDS: x=' + modelLocalBounds.x.toFixed(1)
@@ -289,7 +287,7 @@ html, body {
       console.error('motion model not ready:', group)
       return
     }
-    // 说话锁定: 说话动作播完前, 其他动作排队等待 (talk 本身直接放行)
+    // 说话锁定: 语音结束前其他动作排队，__stopTalkingMotion 会放行。
     if (talking && group !== 'talk') {
       pendingAfterTalk = group
       return
@@ -302,6 +300,25 @@ html, body {
     } catch(e) {
       console.error('set motion error:', group, e)
     }
+  }
+  window.__stopTalkingMotion = function() {
+    if (!model) return
+    talking = false
+    talkElapsed = 0
+    model.internalModel.coreModel.setParameterValueById('ParamMouthOpenY', 0)
+    const next = pendingAfterTalk || 'idle'
+    pendingAfterTalk = null
+    window.__setMotion(next)
+  }
+  // 静音/无可读文本仍保留短身体反馈，但不进入 speaking 状态；
+  // beforeModelUpdate 会覆盖 motion 内的嘴部曲线并保持闭嘴。
+  window.__playSilentReplyMotion = function() {
+    if (!model) return
+    talking = false
+    talkElapsed = 0
+    pendingAfterTalk = null
+    model.internalModel.coreModel.setParameterValueById('ParamMouthOpenY', 0)
+    model.motion('talk', 0, 3)
   }
   window.__setEmotion = function(emotion) {
     if (!model) return

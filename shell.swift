@@ -304,6 +304,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
     var lastActivity = Date()
     var isUserDragging = false
     var isAIReplying = false
+    private var isReplySpeechActive = false   // speak() 已接管回复输出；允许丢弃输入的识别会话与 TTS 并存
     var isInputOpen = false   // 输入框/设置面板打开中 = 操作中, 禁止漫游
     var inputBar: InputBar?  // 自绘输入条 (无系统 sheet)
     var pendingEmotions: [String] = []   // AI 回复的多情绪标签 (依次播放)
@@ -668,6 +669,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
                     let text = result.bestTranscription.formattedString.trimmingCharacters(in: .whitespacesAndNewlines)
                     if self.voiceChatCanProcessInput(manual: self.voiceChatManualMode) {
                         if !text.isEmpty, text != self.voiceChatText {
+                            // 此时识别器正在接收用户语音，绝不能保留回复的说话/口型动作。
+                            self.stopTalkingMotion()
                             self.voiceChatText = text
                             self.voiceChatLastSpeechAt = Date()
                             if self.voiceChatUtteranceStartedAt == nil { self.voiceChatUtteranceStartedAt = Date() }
@@ -697,6 +700,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
             recordingEngine.prepare()
             try recordingEngine.start()
             isVoiceChatListening = true
+            // AI/TTS 期间会提前重建一个“丢弃输入”的识别会话；只有真正进入听用户状态才复位动作。
+            if !isReplySpeechActive { stopTalkingMotion() }
             if force { voiceChatManualMode = true }   // manual 标记仅在会话真正启动后生效 (避免与常驻会话竞争)
             voiceChatSilenceTimer?.invalidate()
             voiceChatSilenceTimer = Timer.scheduledTimer(withTimeInterval: 0.25, repeats: true) { [weak self] _ in
@@ -744,7 +749,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
             return
         }
         let now = Date()
-        if let last = voiceChatLastSpeechAt, now.timeIntervalSince(last) >= 2.2 {
+        // 中文短句尾部 1.3s 静音即可可靠判停；原 2.2s 会在每轮固定增加近一秒等待。
+        if let last = voiceChatLastSpeechAt, now.timeIntervalSince(last) >= 1.3 {
             finishVoiceChatUtterance()
         } else if let started = voiceChatUtteranceStartedAt, now.timeIntervalSince(started) >= 15.0 {
             finishVoiceChatUtterance()
@@ -761,6 +767,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
         let text = voiceChatText.trimmingCharacters(in: .whitespacesAndNewlines)
         resetVoiceChatUtterance()
         guard !text.isEmpty, voiceChatCanProcessInput(manual: voiceChatManualMode) else { return }
+        // 用户话语已结束、AI 回复尚未开始；明确清掉任何遗留的 talk lock / 口型驱动。
+        stopTalkingMotion()
         showBubble("你说: " + text)
         handleJSEvent("VOICECHAT: recognized text=\(text)")
         handleJSEvent("VOICECHAT: sent-to-AI")
@@ -835,6 +843,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
 
     // 调 AI (自定义 API 优先, 否则 Hermes gateway)
     func askHermes(_ text: String) {
+        let requestStartedAt = Date()
         markActivity()
         isAIReplying = true
         let cfg = loadConfig()
@@ -991,7 +1000,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
             ],
             "tools": tools,
             "tool_choice": "auto",
-            "max_tokens": 300
+            // 系统提示要求不超过 80 个中文字；保留工具参数余量，同时避免网关生成无用长尾。
+            "max_tokens": 180
         ]
         req.httpBody = try? JSONSerialization.data(withJSONObject: body)
         showBubble("🐳 让我想想...")
@@ -1000,6 +1010,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
                 guard let self else { return }
                 self.isAIReplying = false
                 self.markActivity()
+                self.handleJSEvent("HERMES_RESPONSE: \(Int(Date().timeIntervalSince(requestStartedAt) * 1000))ms bytes=\(data?.count ?? 0)")
                 if let err {
                     self.showBubble("⚠️ 网络错误: \(err.localizedDescription)")
                     return
@@ -1383,13 +1394,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
     }
 
     func startTalkingMotion() {
+        // 识别会话可能在回复期间提前重建；只有已由 speak() 标记的回复语音可以在该窗口说话。
+        guard !isVoiceChatListening || isReplySpeechActive else { return }
         let js = "window.__setMotion ? window.__setMotion('talk') : 0"
         webView.evaluateJavaScript(js, completionHandler: nil)
         handleJSEvent("TALK_DURING_SPEECH: talk")
     }
 
     func stopTalkingMotion() {
-        let js = "window.__setMotion ? window.__setMotion('idle') : 0"
+        isReplySpeechActive = false
+        let js = "window.__stopTalkingMotion ? window.__stopTalkingMotion() : (window.__setMotion ? window.__setMotion('idle') : 0)"
         webView.evaluateJavaScript(js, completionHandler: nil)
     }
 
@@ -1446,22 +1460,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
         text.unicodeScalars.contains { CharacterSet.alphanumerics.contains($0) }
     }
 
-    // 说话输出与说话动作强绑定: 语音开关只控制"出不出声", 说话动作始终跟随气泡
+    // 口型与真实语音强绑定；静音/无可读内容仅保留闭嘴的身体反馈。
     func speak(_ text: String, emotion: String? = nil, prosodyOverride: SpeechProsody? = nil) {
         guard !text.isEmpty else { return }
         stopSpeech()
+        isReplySpeechActive = true
         let speechText = cleanSpeechText(text)
         guard containsSpeechContent(speechText) else {
-            // 无可读内容 (纯表情/颜文字): 仍播说话动作 + 显示气泡, 只是不发声
+            // 无可读内容 (纯表情/颜文字): 保留身体反馈，但无声音就不驱动嘴。
             showBubble(text)
-            startTalkingMotion()
+            webView.evaluateJavaScript("window.__playSilentReplyMotion ? window.__playSilentReplyMotion() : 0", completionHandler: nil)
+            isReplySpeechActive = false
             handleJSEvent("TTS_SKIP: no speakable text after cleaning")
             return
         }
         guard speechEnabled() else {
-            // 语音开关关闭: 播说话动作 + 气泡, 不发声
+            // 语音开关关闭: 保留短身体反馈 + 气泡，但嘴保持关闭。
             showBubble(text)
-            startTalkingMotion()
+            webView.evaluateJavaScript("window.__playSilentReplyMotion ? window.__playSilentReplyMotion() : 0", completionHandler: nil)
+            isReplySpeechActive = false
             DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { [weak self] in
                 self?.stopTalkingMotion()
             }
@@ -1480,9 +1497,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
             return
         }
         let requestID = UUID()
+        let ttsStartedAt = Date()
         speechRequestID = requestID
-        // TTS 生成就开始说话动作 (避免生成期间看起来没反应)
-        startTalkingMotion()
         let output = "/tmp/whalepet_tts_\(requestID.uuidString).mp3"
         let params = prosodyOverride ?? prosody(for: emotion)
         let process = Process()
@@ -1554,7 +1570,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
                     self.handleJSEvent("TTS_PLAYBACK_ERROR: \(String(describing: note.userInfo))")
                     self.stopSpeech()
                 }
-                self.startTalkingMotion()  // 幂等: 已在 TTS 生成时启动
+                // 只在真实音频开始播放时启动口型，避免 TTS 网络生成期间空口。
+                self.startTalkingMotion()
                 self.speechPlayer?.play()
                 // 字音同步: 语音开始的同时启动打字机, 文字按音频时长均匀打出
                 let typeJs: String
@@ -1564,7 +1581,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
                     typeJs = "window.__showBubble ? window.__showBubble('\(self.jsEscapedString(text))', 0) : 0"
                 }
                 self.webView.evaluateJavaScript(typeJs, completionHandler: nil)
-                self.handleJSEvent("SPEAK_EDGE: voice=\(voice) emotion=\(emotion ?? "default") rate=\(params.rate) pitch=\(params.pitch) volume=\(params.volume) chars=\(speechText.count) dur=\(Int(durationMs))ms")
+                self.handleJSEvent("SPEAK_EDGE: ready=\(Int(Date().timeIntervalSince(ttsStartedAt) * 1000))ms voice=\(voice) emotion=\(emotion ?? "default") rate=\(params.rate) pitch=\(params.pitch) volume=\(params.volume) chars=\(speechText.count) dur=\(Int(durationMs))ms")
             }
         }
         do {
