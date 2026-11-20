@@ -56,6 +56,22 @@ final class LocalHTTPServer {
                 if let u = URL(string: path) { path = u.path }
             }
             if path == "/" { path = "/index.html" }
+            // 调试端点: GET /debug/speak?text=... 触发一次真实说话（用于验证口型动画）
+            if path.hasPrefix("/debug/speak") {
+                var text = "调试说话测试，一二三四五六七八九十。"
+                if let q = path.components(separatedBy: "text=").dropFirst().first,
+                   let decoded = q.removingPercentEncoding, !decoded.isEmpty {
+                    text = decoded
+                }
+                DispatchQueue.main.async {
+                    NotificationCenter.default.post(name: .init("WhalePetDebugSpeak"),
+                                                    object: nil, userInfo: ["text": text])
+                }
+                let body = "OK: queued speak len=\(text.count)"
+                let header = "HTTP/1.1 200 OK\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: \(body.utf8.count)\r\nConnection: close\r\n\r\n"
+                conn.send(content: Data((header + body).utf8), completion: .contentProcessed { _ in conn.cancel() })
+                return
+            }
             // 规范化: 去掉 .. 和 %
             path = path.removingPercentEncoding ?? path
             if path.contains("..") { path = "/index.html" }
@@ -280,6 +296,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
     let speechSynthesizer = AVSpeechSynthesizer()
     var speechPlayer: AVPlayer?
     var speechProcess: Process?
+    var ttsDaemonProcess: Process?
+    var ttsDaemonInput: FileHandle?
+    var ttsDaemonOutput: FileHandle?
+    var ttsDaemonBuffer = Data()
+    var ttsDaemonCompletion: ((String, Bool, String) -> Void)?
     var speechRequestID = UUID()
     var speechOutputPath: String?
     var speechEndObserver: NSObjectProtocol?
@@ -319,9 +340,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
     }
 
     let edgeVoiceChoices: [(title: String, id: String)] = [
-        ("晓伊·萝莉(更萌)", "zh-CN-XiaoyiNeural"),
-        ("晓晓·温暖", "zh-CN-XiaoxiaoNeural"),
-        ("云夏·可爱男声", "zh-CN-YunxiaNeural"),
+        ("豆包·vv 女声(火山)", "zh_female_vv_uranus_bigtts"),
+        ("晓伊·萝莉(云端)", "zh-CN-XiaoyiNeural"),
+        ("晓晓·温暖(云端)", "zh-CN-XiaoxiaoNeural"),
         ("系统默认", "system")
     ]
 
@@ -353,7 +374,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
     }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        // 调试端点 GET /debug/speak?text=... 通过通知触发一次真实说话
+        NotificationCenter.default.addObserver(
+            forName: .init("WhalePetDebugSpeak"), object: nil, queue: .main
+        ) { [weak self] note in
+            guard let self else { return }
+            let text = note.userInfo?["text"] as? String ?? "调试说话测试。"
+            self.handleJSEvent("DEBUG_SPEAK: \(text)")
+            self.speak(text, emotion: "开心")
+        }
         speechSynthesizer.delegate = self
+        // Preload Python + edge-tts before the first reply; synthesis still starts only on demand.
+        if let helper = ttsHelperPath() {
+            try? startTTSDaemonIfNeeded(helper: helper)
+        }
         // 启动内置 HTTP server (提供本地 Live2D 页面)
         httpServer = LocalHTTPServer(root: RESOURCE_DIR, port: SERVER_PORT)
         _ = httpServer?.start()
@@ -459,6 +493,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
         // 简化: 整个窗口可点击, 点击后触发动作/对话
     }
 
+    func applicationWillTerminate(_ notification: Notification) {
+        ttsDaemonOutput?.readabilityHandler = nil
+        ttsDaemonInput?.closeFile()
+        ttsDaemonProcess?.terminate()
+    }
+
     func setupStatusBar() {
         let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         item.button?.title = "🐳"
@@ -472,10 +512,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
     }
 
     @objc func playMotion() {
-        // 通过 JS 触发随机动作 (测试/菜单触发)
+        // 通过 JS 触发随机动作 (测试/菜单触发)；走 __setMotion 以遵守说话锁定
         let groups = ["selfie", "ketchup", "bubble", "splash", "openLid", "aidale"]
         let g = groups[Int.random(in: 0..<groups.count)]
-        let js = "try { window.__petModel.motion('\(g)', 0, 3); 'ok' } catch(e) { 'err:' + e.message }"
+        let js = "try { window.__setMotion ? window.__setMotion('\(g)') : window.__petModel.motion('\(g)', 0, 3); 'ok' } catch(e) { 'err:' + e.message }"
         webView.evaluateJavaScript(js) { result, err in
             self.handleJSEvent("MENU_MOTION: \(g) -> \(result ?? "nil") err=\(String(describing: err))")
         }
@@ -729,7 +769,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
     }
 
     private func voiceChatCanProcessInput(manual: Bool = false) -> Bool {
-        let isSpeaking = speechProcess != nil || speechPlayer != nil || speechSynthesizer.isSpeaking
+        // 必须把 TTS 生成阶段(ttsDaemonCompletion 未回调)也算作"正在说话"。
+        // 否则识别器重启后的 partial result 会调 stopTalkingMotion(),
+        // 把 isReplySpeechActive 重置为 false, 导致音频就绪后 startTalkingMotion() 被 guard 挡掉。
+        let isSpeaking = isReplySpeechActive
+            || ttsDaemonCompletion != nil
+            || speechProcess != nil
+            || speechPlayer != nil
+            || speechSynthesizer.isSpeaking
         if manual {
             // 🎤 手动模式: 由输入框按钮触发, 监听期间不因 isInputOpen 而丢弃
             return !isAIReplying && !isSpeaking && !isUserDragging && !isRecording
@@ -784,7 +831,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
         voiceChatReplyMonitor?.invalidate()
         voiceChatReplyMonitor = Timer.scheduledTimer(withTimeInterval: 0.25, repeats: true) { [weak self] timer in
             guard let self else { timer.invalidate(); return }
-            let isSpeaking = self.speechProcess != nil || self.speechPlayer != nil || self.speechSynthesizer.isSpeaking
+            let isSpeaking = self.isReplySpeechActive
+                || self.ttsDaemonCompletion != nil
+                || self.speechProcess != nil
+                || self.speechPlayer != nil
+                || self.speechSynthesizer.isSpeaking
             if self.isVoiceChatConversationActive && !self.isAIReplying && !isSpeaking {
                 self.isVoiceChatConversationActive = false
                 timer.invalidate()
@@ -1316,7 +1367,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
         wanderTimer = Timer.scheduledTimer(withTimeInterval: Double.random(in: 6...10), repeats: false) { [weak self] _ in
             guard let self else { return }
             defer { self.scheduleWander() }
-            let isSpeaking = self.speechProcess != nil || self.speechPlayer != nil || self.speechSynthesizer.isSpeaking
+            let isSpeaking = self.isReplySpeechActive
+                || self.ttsDaemonCompletion != nil
+                || self.speechProcess != nil
+                || self.speechPlayer != nil
+                || self.speechSynthesizer.isSpeaking
             // 只有待机满 3 分钟(180s)才自主移动; 有输入/输入框打开/设置面板/AI回复/拖拽/语音/动画中一律不动
             guard self.wanderEnabled(), Date().timeIntervalSince(self.lastActivity) > 180,
                   !self.isUserDragging, !self.isAIReplying, !self.isInputOpen, !isSpeaking, !self.isWindowAnimating else { return }
@@ -1348,7 +1403,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
     }
 
     func selectedVoice() -> String {
-        UserDefaults.standard.string(forKey: "pet_voice") ?? "zh-CN-XiaoyiNeural"
+        UserDefaults.standard.string(forKey: "pet_voice") ?? "zh_female_vv_uranus_bigtts"
+    }
+
+    /// 火山音色（_bigtts 结尾）走 volc 后端；其余走 edge-tts
+    func ttsBackend(for voice: String) -> String {
+        voice.contains("_bigtts") ? "volc" : "edge"
+    }
+
+    /// 火山音调（半音，-12..12）。默认 +2 = 升高约两度（更萌）
+    func volcPitchSemitones() -> Int {
+        if UserDefaults.standard.object(forKey: "pet_pitchST") == nil { return 2 }
+        return UserDefaults.standard.integer(forKey: "pet_pitchST")
     }
 
     func prosody(for emotion: String?) -> SpeechProsody {
@@ -1375,6 +1441,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
         speechRequestID = UUID()
         speechProcess?.terminate()
         speechProcess = nil
+        ttsDaemonCompletion = nil
+        if let data = try? JSONSerialization.data(withJSONObject: ["command": "cancel"]),
+           let input = ttsDaemonInput {
+            input.write(data + Data([0x0a]))
+        }
         speechPlayer?.pause()
         speechPlayer = nil
         if let observer = speechEndObserver {
@@ -1501,35 +1572,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
         speechRequestID = requestID
         let output = "/tmp/whalepet_tts_\(requestID.uuidString).mp3"
         let params = prosodyOverride ?? prosody(for: emotion)
-        let process = Process()
-        let environment = ProcessInfo.processInfo.environment
-        let venv = environment["TTS_VENV"] ?? "/tmp/ttsvenv"
-        let venvPython = venv + "/bin/python"
-        process.executableURL = URL(fileURLWithPath: FileManager.default.isExecutableFile(atPath: venvPython) ? venvPython : "/usr/bin/python3")
-        process.arguments = [helper, "--text", speechText, "--voice", voice,
-                             "--rate", params.rate, "--pitch", params.pitch,
-                             "--volume", params.volume, "--output", output]
-        var childEnvironment = environment
-        childEnvironment["TTS_VENV"] = venv
-        if let proxy = environment["TTS_PROXY"], !proxy.isEmpty {
-            childEnvironment["http_proxy"] = proxy
-            childEnvironment["https_proxy"] = proxy
-        }
-        process.environment = childEnvironment
-        let errorPipe = Pipe()
-        process.standardError = errorPipe
-        process.terminationHandler = { [weak self] finished in
-            let errorData = errorPipe.fileHandleForReading.readDataToEndOfFile()
-            let errorText = String(data: errorData, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let finishGeneration: (String, Bool, String) -> Void = { [weak self] responseID, ok, errorText in
             DispatchQueue.main.async {
                 guard let self, self.speechRequestID == requestID else {
                     try? FileManager.default.removeItem(atPath: output)
                     return
                 }
-                self.speechProcess = nil
-                guard finished.terminationStatus == 0,
-                      FileManager.default.fileExists(atPath: output) else {
-                    self.handleJSEvent("TTS_FALLBACK: exit=\(finished.terminationStatus) \(errorText.prefix(180))")
+                guard responseID == requestID.uuidString else { return }
+                self.ttsDaemonCompletion = nil
+                guard ok, FileManager.default.fileExists(atPath: output) else {
+                    self.handleJSEvent("TTS_FALLBACK: \(errorText.prefix(180))")
                     self.speakWithSystem(speechText, emotion: emotion, displayText: text)
                     return
                 }
@@ -1581,24 +1633,37 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
                     typeJs = "window.__showBubble ? window.__showBubble('\(self.jsEscapedString(text))', 0) : 0"
                 }
                 self.webView.evaluateJavaScript(typeJs, completionHandler: nil)
-                self.handleJSEvent("SPEAK_EDGE: ready=\(Int(Date().timeIntervalSince(ttsStartedAt) * 1000))ms voice=\(voice) emotion=\(emotion ?? "default") rate=\(params.rate) pitch=\(params.pitch) volume=\(params.volume) chars=\(speechText.count) dur=\(Int(durationMs))ms")
+                self.handleJSEvent("SPEAK_CLOUD: ready=\(Int(Date().timeIntervalSince(ttsStartedAt) * 1000))ms backend=\(self.ttsBackend(for: voice)) voice=\(voice) emotion=\(emotion ?? "default") rate=\(params.rate) pitchST=\(self.volcPitchSemitones()) volume=\(params.volume) chars=\(speechText.count) dur=\(Int(durationMs))ms")
             }
         }
         do {
-            try process.run()
-            speechProcess = process
-            handleJSEvent("TTS_GENERATE: voice=\(voice) emotion=\(emotion ?? "default")")
-            // edge-tts 网络合成可能很慢 (3-6s); 4 秒看门狗: 超时未产出音频 → 立即转系统本地 TTS (<1s), 口型照播
+            try startTTSDaemonIfNeeded(helper: helper)
+            ttsDaemonCompletion = finishGeneration
+            let request: [String: String] = [
+                "id": requestID.uuidString, "text": speechText, "voice": voice,
+                "rate": params.rate, "pitch": params.pitch, "volume": params.volume,
+                "backend": ttsBackend(for: voice),
+                "pitchST": String(volcPitchSemitones()),
+                "output": output
+            ]
+            let requestData = try JSONSerialization.data(withJSONObject: request)
+            ttsDaemonInput?.write(requestData + Data([0x0a]))
+            let backend = ttsBackend(for: voice)
+            handleJSEvent("TTS_GENERATE: backend=\(backend) voice=\(voice) emotion=\(emotion ?? "default")")
+            // 火山双向流式通常 <1.5s；edge-tts 网络合成可能 3-6s。看门狗: 超时未产出 → 转系统本地 TTS
+            let watchdogSeconds: Double = backend == "volc" ? 2.5 : 4.0
             let watchdog = DispatchWorkItem { [weak self] in
-                guard let self, self.speechRequestID == requestID, self.speechProcess === process,
+                guard let self, self.speechRequestID == requestID, self.ttsDaemonCompletion != nil,
                       self.speechPlayer == nil || self.speechPlayer?.timeControlStatus != .playing else { return }
-                self.handleJSEvent("TTS_TIMEOUT: edge-tts >4s, fallback to system TTS")
-                process.terminate()
+                self.handleJSEvent("TTS_TIMEOUT: \(backend) >\(watchdogSeconds)s, fallback to system TTS")
+                self.ttsDaemonCompletion = nil
+                if let data = try? JSONSerialization.data(withJSONObject: ["command": "cancel"]),
+                   let input = self.ttsDaemonInput { input.write(data + Data([0x0a])) }
                 self.speakWithSystem(speechText, emotion: emotion, displayText: text)
             }
-            DispatchQueue.main.asyncAfter(deadline: .now() + 4.0, execute: watchdog)
-            // 音频就绪 (SPEAK_EDGE 路径) 后取消看门狗
-            DispatchQueue.main.asyncAfter(deadline: .now() + 4.5) { [weak self] in
+            DispatchQueue.main.asyncAfter(deadline: .now() + watchdogSeconds, execute: watchdog)
+            // 音频就绪后取消看门狗
+            DispatchQueue.main.asyncAfter(deadline: .now() + watchdogSeconds + 0.5) { [weak self] in
                 if self?.speechRequestID == requestID, self?.speechPlayer != nil {
                     watchdog.cancel()
                 }
@@ -1606,6 +1671,66 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
         } catch {
             handleJSEvent("TTS_FALLBACK: process launch failed: \(error.localizedDescription)")
             speakWithSystem(speechText, emotion: emotion, displayText: text)
+        }
+    }
+
+    func startTTSDaemonIfNeeded(helper: String) throws {
+        if let process = ttsDaemonProcess, process.isRunning, ttsDaemonInput != nil { return }
+        // 重启前清空解析缓冲，避免旧进程残留的半行 JSON 与新进程首行拼接
+        ttsDaemonBuffer.removeAll(keepingCapacity: true)
+        let process = Process()
+        let environment = ProcessInfo.processInfo.environment
+        let venv = environment["TTS_VENV"] ?? "/tmp/ttsvenv"
+        let venvPython = venv + "/bin/python"
+        process.executableURL = URL(fileURLWithPath: FileManager.default.isExecutableFile(atPath: venvPython) ? venvPython : "/usr/bin/python3")
+        process.arguments = [helper, "--daemon"]
+        var childEnvironment = environment
+        childEnvironment["TTS_VENV"] = venv
+        if let proxy = environment["TTS_PROXY"], !proxy.isEmpty {
+            childEnvironment["http_proxy"] = proxy
+            childEnvironment["https_proxy"] = proxy
+        }
+        process.environment = childEnvironment
+        let input = Pipe()
+        let output = Pipe()
+        process.standardInput = input
+        process.standardOutput = output
+        process.standardError = FileHandle.standardError
+        output.fileHandleForReading.readabilityHandler = { [weak self] handle in
+            let data = handle.availableData
+            guard !data.isEmpty else { return }
+            DispatchQueue.main.async { self?.consumeTTSDaemonOutput(data) }
+        }
+        process.terminationHandler = { [weak self] process in
+            DispatchQueue.main.async {
+                guard let self, self.ttsDaemonProcess === process else { return }
+                self.ttsDaemonProcess = nil
+                self.ttsDaemonInput = nil
+                self.ttsDaemonOutput = nil
+                self.ttsDaemonBuffer.removeAll(keepingCapacity: true)
+                let completion = self.ttsDaemonCompletion
+                self.ttsDaemonCompletion = nil
+                let reason = process.terminationReason == .exit ? "exit" : "signal"
+                completion?(self.speechRequestID.uuidString, false,
+                            "helper daemon exited reason=\(reason) status=\(process.terminationStatus)")
+            }
+        }
+        try process.run()
+        ttsDaemonProcess = process
+        ttsDaemonInput = input.fileHandleForWriting
+        ttsDaemonOutput = output.fileHandleForReading
+    }
+
+    func consumeTTSDaemonOutput(_ data: Data) {
+        ttsDaemonBuffer.append(data)
+        while let newline = ttsDaemonBuffer.firstIndex(of: 0x0a) {
+            let line = ttsDaemonBuffer.prefix(upTo: newline)
+            ttsDaemonBuffer.removeSubrange(...newline)
+            guard let object = try? JSONSerialization.jsonObject(with: Data(line)) as? [String: Any],
+                  let id = object["id"] as? String else { continue }
+            let ok = object["ok"] as? Bool ?? false
+            let error = object["error"] as? String ?? "unknown error"
+            ttsDaemonCompletion?(id, ok, error)
         }
     }
 
@@ -1979,11 +2104,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
     }
 
     // 启动 8 秒后自动触发一个动作 (验证 motion API 有效 + 演示动画)
+    // 必须走 __setMotion, 否则会绕过"说话锁定"把 talk 动作顶掉
     func autoDemoMotion() {
         DispatchQueue.main.asyncAfter(deadline: .now() + 8) {
             let groups = ["selfie", "ketchup", "bubble", "splash", "openLid", "aidale"]
             let g = groups[Int.random(in: 0..<groups.count)]
-            let js = "try { window.__petModel.motion('\(g)', 0, 3); 'ok' } catch(e) { 'err:' + e.message }"
+            let js = "try { window.__setMotion ? window.__setMotion('\(g)') : window.__petModel.motion('\(g)', 0, 3); 'ok' } catch(e) { 'err:' + e.message }"
             self.webView.evaluateJavaScript(js) { result, err in
                 self.handleJSEvent("AUTO_MOTION: \(g) -> \(result ?? "nil") err=\(String(describing: err))")
             }
