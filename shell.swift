@@ -72,6 +72,29 @@ final class LocalHTTPServer {
                 conn.send(content: Data((header + body).utf8), completion: .contentProcessed { _ in conn.cancel() })
                 return
             }
+            // 调试端点: GET /debug/ask?text=... 走完整 askHermes 链路（验证会话续接/超时）
+            if path.hasPrefix("/debug/ask") || path.hasPrefix("/debug/session") {
+                let isReset = path.hasPrefix("/debug/session")
+                var text = isReset ? "" : "调试消息"
+                if let q = path.components(separatedBy: "text=").dropFirst().first,
+                   let decoded = q.removingPercentEncoding, !decoded.isEmpty {
+                    text = decoded
+                }
+                DispatchQueue.main.async {
+                    if isReset {
+                        UserDefaults.standard.removeObject(forKey: "pet_sessionId")
+                        UserDefaults.standard.set(0.0, forKey: "pet_lastExchangeAt")
+                        NotificationCenter.default.post(name: .init("WhalePetDebugSessionReset"), object: nil)
+                    } else {
+                        NotificationCenter.default.post(name: .init("WhalePetDebugAsk"),
+                                                        object: nil, userInfo: ["text": text])
+                    }
+                }
+                let body = isReset ? "OK: session reset" : "OK: queued ask len=\(text.count)"
+                let header = "HTTP/1.1 200 OK\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: \(body.utf8.count)\r\nConnection: close\r\n\r\n"
+                conn.send(content: Data((header + body).utf8), completion: .contentProcessed { _ in conn.cancel() })
+                return
+            }
             // 规范化: 去掉 .. 和 %
             path = path.removingPercentEncoding ?? path
             if path.contains("..") { path = "/index.html" }
@@ -377,6 +400,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
     }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        // 调试端点 GET /debug/ask?text=... 走完整 askHermes 链路（验证会话续接/超时）
+        NotificationCenter.default.addObserver(
+            forName: .init("WhalePetDebugAsk"), object: nil, queue: .main
+        ) { [weak self] note in
+            guard let self, let text = note.userInfo?["text"] as? String else { return }
+            self.handleJSEvent("DEBUG_ASK: \(text)")
+            self.askHermes(text)
+        }
+        NotificationCenter.default.addObserver(
+            forName: .init("WhalePetDebugSessionReset"), object: nil, queue: .main
+        ) { [weak self] _ in
+            self?.handleJSEvent("DEBUG_SESSION_RESET")
+            self?.showBubble("🆕 会话已重置")
+        }
         // 调试端点 GET /debug/speak?text=... 通过通知触发一次真实说话
         NotificationCenter.default.addObserver(
             forName: .init("WhalePetDebugSpeak"), object: nil, queue: .main
@@ -968,7 +1005,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
         let fullPrompt = systemPrompt + """
 
         【可用的工具】
-        - set_emotion(emotion): 情绪表情，可选值：开心、悲伤、生气、害羞、惊讶、疑惑、疲惫、调皮、无语、心动、星星眼、爱心眼、晕、哭、发呆（每次回复必须调用一次，选最贴切的）
+        - set_emotion(emotion): 情绪表情，可选值：开心、悲伤、生气、害羞、惊讶、疑惑、疲惫、调皮、无语、心动、星星眼、爱心眼、晕、哭、发呆、恶魔角、天使、猫耳爱心、兔兔星星、耍帅、花花爱心、心跳脸红、虚脱流汗、晕眩、兴奋眨眼、舔嘴、阴郁（每次回复必须调用一次，选最贴切的）
         - play_motion(motion): 身体动作，可选值：待机、撒娇、自拍、简单自拍、番茄酱、开盖、吹泡泡、喷水、爬动、招手、比心、摸头、摇尾巴、露肚皮、睡觉、伸懒腰、跳舞、蹦跳、生气鼓脸、崇拜、墨镜、猫爪、兔耳、探头、喝咖啡（只在需要明显身体动作时调用）
         - move_window(x, y): 移动窗口，x/y 为 0-100 百分比（需要走动/找我时调用；“找我”可用 direction 参数，移动到用户常驻位置，例如右下角或屏幕中央附近）
         - open_chat(): 弹出文本输入框让主人打字对话（主人要求打字/打开输入框时调用）
@@ -1013,7 +1050,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
                             "emotion": [
                                 "type": "string",
                                 "description": "要显示的情绪",
-                                "enum": ["开心", "悲伤", "生气", "害羞", "惊讶", "疑惑", "疲惫", "调皮", "无语", "心动", "星星眼", "爱心眼", "晕", "哭", "发呆"]
+                                "enum": ["开心", "悲伤", "生气", "害羞", "惊讶", "疑惑", "疲惫", "调皮", "无语", "心动", "星星眼", "爱心眼", "晕", "哭", "发呆", "恶魔角", "天使", "猫耳爱心", "兔兔星星", "耍帅", "花花爱心", "心跳脸红", "虚脱流汗", "晕眩", "兴奋眨眼", "舔嘴", "阴郁"]
                             ]
                         ],
                         "required": ["emotion"],
@@ -1149,7 +1186,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
                     , "peek": "peek", "探头": "peek"
                     , "coffee": "coffee", "喝咖啡": "coffee"
                 ]
-                let validEmotions: Set<String> = ["开心", "悲伤", "生气", "害羞", "惊讶", "疑惑", "疲惫", "调皮", "无语", "心动", "星星眼", "爱心眼", "晕", "哭", "发呆"]
+                let validEmotions: Set<String> = ["开心", "悲伤", "生气", "害羞", "惊讶", "疑惑", "疲惫", "调皮", "无语", "心动", "星星眼", "爱心眼", "晕", "哭", "发呆", "恶魔角", "天使", "猫耳爱心", "兔兔星星", "耍帅", "花花爱心", "心跳脸红", "虚脱流汗", "晕眩", "兴奋眨眼", "舔嘴", "阴郁"]
                 let toolCalls = msg["tool_calls"] as? [[String: Any]] ?? []
                 for call in toolCalls {
                     guard let function = call["function"] as? [String: Any],
