@@ -401,6 +401,41 @@ html, body {
       }
     }
   }
+  // 调试: 采样骨架参数, 两次采样差异 = 动画真的在跑（WebGL 无法直接读像素，参数是最硬的证据）
+
+
+// 手动推进模型时钟并逐帧采样骨架参数 —— 不依赖 rAF，因此窗口被遮挡也能验证
+// 参数哈希逐帧变化 = 动作曲线确实在驱动骨骼（硬证据）
+
+  // 调试: 播放一次动作，await 库 Promise 后把结果 console.log 出去（console 已转发到 webview.log）
+  window.__motionTest = function(group) {
+    (async function() {
+      try {
+        if (!model) { console.log('MOTION_RESULT: ' + JSON.stringify({ group: group, err: 'model not ready' })); return }
+        const settings = model.internalModel.settings
+        const arr = (settings.motions || {})[group]
+        const mm = model.internalModel.motionManager
+        const qBefore = (mm._motionQueue || []).length
+        const ret = await model.motion(group, 0, 3)   // Promise<boolean>
+        const qAfter = (mm._motionQueue || []).length
+        const meta = arr && arr[0] ? {
+          file: arr[0].File, duration: arr[0].Duration, loop: arr[0].Loop,
+          fadeIn: arr[0].FadeInTime, fadeOut: arr[0].FadeOutTime,
+          curves: (arr[0].CurveCount !== undefined ? arr[0].CurveCount : null)
+        } : null
+        console.log('MOTION_RESULT: ' + JSON.stringify({
+          group: group, played: ret === true, retType: typeof ret,
+          registered: !!arr, count: arr ? arr.length : 0, meta: meta,
+          queueBefore: qBefore, queueAfter: qAfter,
+          groupsTotal: Object.keys(settings.motions || {}).length
+        }))
+      } catch (e) {
+        console.log('MOTION_RESULT: ' + JSON.stringify({ group: group, err: String(e) }))
+      }
+    })()
+    return 1   // 同步返回可序列化值，WKWebView 才不会报 unsupported type
+  }
+
   // Swift 拖动结束后恢复模型的默认表情，不额外触发动作。
   window.__resetExpression = function() {
     if (!model) return

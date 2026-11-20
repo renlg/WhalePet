@@ -2146,6 +2146,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
                     self.handleJSEvent("DEBUG_MOTION: \(motionGroup)")
                 }
             }
+            // 调试: 监听 /tmp/pet_stats_cmd 文件, 内容=动作组名 -> 播放并 await 库结果（JS 侧 console.log 到 webview.log）
+            let statsPath = "/tmp/pet_stats_cmd"
+            if let statsTxt = try? String(contentsOfFile: statsPath, encoding: .utf8) {
+                let groupArg = statsTxt.trimmingCharacters(in: .whitespacesAndNewlines)
+                try? FileManager.default.removeItem(atPath: statsPath)
+                self.handleJSEvent("MOTION_TEST_START: \(groupArg)")
+                let js = "window.__motionTest ? window.__motionTest('\(groupArg)') : 0"
+                self.webView.evaluateJavaScript(js, completionHandler: nil)
+            }
             // 调试: 监听 /tmp/pet_move_cmd 文件, 内容为 "x% y%" -> moveWindow (触发 crawl 爬动)
             let movePath = "/tmp/pet_move_cmd"
             if let moveTxt = try? String(contentsOfFile: movePath, encoding: .utf8) {
