@@ -46,6 +46,14 @@ final class LocalHTTPServer {
             self?.handle(conn)
         }
         listener?.start(queue: .global(qos: .userInitiated))
+        // token 落盘: App 以 .app 启动时 stdout 无处可见, 调试端点会变成完全不可用。
+        // 写到用户私有目录(0700)，并同步 flush，避免被缓冲吞掉。
+        let tokenPath = NSHomeDirectory() + "/Library/Application Support/WhalePet/debug_session_token"
+        try? FileManager.default.createDirectory(
+            atPath: (tokenPath as NSString).deletingLastPathComponent,
+            withIntermediateDirectories: true,
+            attributes: [.posixPermissions: 0o700])
+        try? debugToken.write(toFile: tokenPath, atomically: true, encoding: .utf8)
         print("WhalePet debug token: \(debugToken)")
         return true
     }
