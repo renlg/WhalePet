@@ -172,7 +172,7 @@ html, body {
   // 点击: 随机动作；走 __setMotion 以遵守说话锁定 (语音期间自动排队)
   canvas.addEventListener('click', () => {
     if (!model) return
-    const groups = ['selfie', 'ketchup', 'bubble', 'splash', 'openLid', 'aidale']
+    const groups = ['selfie', 'ketchup', 'bubble', 'splash', 'openLid', 'aidale', 'wave', 'heartKiss', 'headpat', 'tailWag', 'bellyUp', 'sleep', 'stretch', 'dance', 'hop', 'angryPuff', 'worship', 'coolShades', 'catPaws', 'bunnyEars', 'peek', 'coffee']
     const g = groups[Math.floor(Math.random() * groups.length)]
     if (window.__setMotion) {
       window.__setMotion(g)
@@ -285,21 +285,38 @@ html, body {
     '问号': '问号', '疑惑': '问号', '疑问': '问号', '不解': '问号',
     '惊讶': '感叹号', '惊': '感叹号', '震惊': '感叹号', '吓': '感叹号',
     '阴暗': '阴暗', '黑化': '阴暗', '腹黑': '阴暗',
+    '恶魔角': 'devilHornSmug', '邪笑': 'devilHornSmug',
+    '天使': 'angelHaloSmile', '光环': 'angelHaloSmile',
+    '猫猫爱心': 'catHeartEyes', '猫耳爱心': 'catHeartEyes',
+    '兔兔星星': 'bunnyStarEyes', '兔耳星星': 'bunnyStarEyes',
+    '墨镜比耶': 'shadesPeace', '耍帅': 'shadesPeace',
+    '花花爱心': 'flowerLove', '比心': 'flowerLove',
+    '心跳脸红': 'heartBeatBlush', '心动脸红': 'heartBeatBlush',
+    '累到吐魂': 'ghostOutTired', '虚脱流汗': 'ghostOutTired',
+    '晕汗': 'dizzySweat', '晕眩': 'dizzySweat',
+    '兴奋眨眼': 'excitedWink', '眨眼': 'excitedWink',
+    '好吃': 'lickLipsYum', '舔嘴': 'lickLipsYum',
+    '阴郁': 'gloomySulk', '闹别扭': 'gloomySulk',
   }
   const MOTION_MAP = {
-    '开心': 'selfie', '高兴': 'selfie', '愉快': 'selfie', '喜悦': 'selfie',
-    '兴奋': 'bubble', '星星': 'bubble', '星星眼': 'bubble', '崇拜': 'bubble', '期待': 'bubble',
+    '开心': 'hop', '高兴': 'wave', '愉快': 'dance', '喜悦': 'hop',
+    '兴奋': 'dance', '星星': 'worship', '星星眼': 'worship', '崇拜': 'worship', '期待': 'peek',
     '调皮': 'selfieQuick', '俏皮': 'selfieQuick', '淘气': 'selfieQuick', '吐舌': 'selfieQuick',
-    '生气': 'ketchup', '愤怒': 'ketchup', '气': 'ketchup', '恼': 'ketchup',
-    '害羞': 'aidale', '脸红': 'aidale', '腼腆': 'aidale',
-    '心动': 'aidale', '爱心': 'aidale', '爱': 'aidale', '喜欢': 'aidale',
+    '生气': 'angryPuff', '愤怒': 'angryPuff', '气': 'angryPuff', '恼': 'angryPuff',
+    '害羞': 'headpat', '脸红': 'headpat', '腼腆': 'headpat',
+    '心动': 'heartKiss', '爱心': 'heartKiss', '爱': 'heartKiss', '喜欢': 'heartKiss',
+    '疲惫': 'sleep', '累': 'stretch', '困': 'sleep', '睡觉': 'sleep',
+    '招手': 'wave', '摸头': 'headpat', '摇尾巴': 'tailWag', '露肚皮': 'bellyUp',
+    '墨镜': 'coolShades', '猫爪': 'catPaws', '兔耳': 'bunnyEars', '探头': 'peek', '喝咖啡': 'coffee',
     '惊讶': 'openLid', '震惊': 'openLid', '惊': 'openLid', '吓': 'openLid',
     '哭': 'splash', '哭泣': 'splash', '大哭': 'splash',
     '悲伤': 'splash', '难过': 'splash', '伤心': 'splash', '沮丧': 'splash', '失落': 'splash',
   }
   const MOTION_GROUPS = new Set([
     'idle', 'aidale', 'selfie', 'selfieQuick',
-    'ketchup', 'openLid', 'bubble', 'splash', 'crawl', 'talk'
+    'ketchup', 'openLid', 'bubble', 'splash', 'crawl', 'talk',
+    'wave', 'heartKiss', 'headpat', 'tailWag', 'bellyUp', 'sleep', 'stretch', 'dance',
+    'hop', 'angryPuff', 'worship', 'coolShades', 'catPaws', 'bunnyEars', 'peek', 'coffee'
   ])
   window.__setMotion = function(group) {
     if (!MOTION_GROUPS.has(group)) {

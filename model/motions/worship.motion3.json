@@ -1,0 +1,95 @@
+{
+  "Version": 3,
+  "Meta": {
+    "Duration": 2.8,
+    "Fps": 30,
+    "Loop": false,
+    "AreBeziersRestricted": true,
+    "CurveCount": 5,
+    "TotalSegmentCount": 13,
+    "TotalPointCount": 18,
+    "UserDataCount": 0,
+    "TotalUserDataSize": 0
+  },
+  "Curves": [
+    {
+      "Target": "Parameter",
+      "Id": "ParamCheek16",
+      "Segments": [
+        0,
+        1,
+        0,
+        0.4,
+        1,
+        0,
+        2.8,
+        0
+      ]
+    },
+    {
+      "Target": "Parameter",
+      "Id": "phone7",
+      "Segments": [
+        0,
+        1,
+        0,
+        0.4,
+        1,
+        0,
+        2.8,
+        0
+      ]
+    },
+    {
+      "Target": "Parameter",
+      "Id": "Param73",
+      "Segments": [
+        0,
+        1,
+        0,
+        0.6,
+        0.4,
+        0,
+        1.4,
+        1,
+        0,
+        2.8,
+        0
+      ]
+    },
+    {
+      "Target": "Parameter",
+      "Id": "Param74",
+      "Segments": [
+        0,
+        1,
+        0,
+        0.6,
+        0.4,
+        0,
+        1.4,
+        1,
+        0,
+        2.8,
+        0
+      ]
+    },
+    {
+      "Target": "Parameter",
+      "Id": "ParamCheek26",
+      "Segments": [
+        0,
+        1,
+        0,
+        0.5,
+        0.5,
+        0,
+        1.5,
+        1,
+        0,
+        2.8,
+        0
+      ]
+    }
+  ]
+}

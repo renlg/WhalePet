@@ -353,6 +353,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
         var apiKey: String
         var model: String
         var systemPrompt: String
+        var sessionIdleTimeoutMinutes: Int
     }
 
     func loadConfig() -> AIConfig {
@@ -361,7 +362,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
             apiBaseURL: d.string(forKey: "pet_apiBaseURL") ?? "",
             apiKey: d.string(forKey: "pet_apiKey") ?? "",
             model: d.string(forKey: "pet_model") ?? "hermes-token",
-            systemPrompt: d.string(forKey: "pet_systemPrompt") ?? "你是一只可爱的鲸鱼娘桌宠, 用简短可爱的语气回答, 不超过80字, 可以带颜文字。"
+            systemPrompt: d.string(forKey: "pet_systemPrompt") ?? "你是一只可爱的鲸鱼娘桌宠, 用简短可爱的语气回答, 不超过80字, 可以带颜文字。",
+            sessionIdleTimeoutMinutes: d.object(forKey: "pet_sessionIdleTimeoutMinutes") == nil ? 30 : max(0, d.integer(forKey: "pet_sessionIdleTimeoutMinutes"))
         )
     }
 
@@ -371,6 +373,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
         d.set(c.apiKey, forKey: "pet_apiKey")
         d.set(c.model, forKey: "pet_model")
         d.set(c.systemPrompt, forKey: "pet_systemPrompt")
+        d.set(c.sessionIdleTimeoutMinutes, forKey: "pet_sessionIdleTimeoutMinutes")
     }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
@@ -464,6 +467,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
         // 右键菜单
         let ctxMenu = NSMenu()
         ctxMenu.addItem(NSMenuItem(title: "🎬 播放动作", action: #selector(playMotion), keyEquivalent: ""))
+        ctxMenu.addItem(NSMenuItem(title: "🆕 开新会话", action: #selector(newSession), keyEquivalent: ""))
         ctxMenu.addItem(NSMenuItem(title: "⚙️ 设置大小", action: #selector(openSettings), keyEquivalent: ","))
         ctxMenu.addItem(NSMenuItem(title: "↩ 回到右下角", action: #selector(resetPos), keyEquivalent: ""))
         ctxMenu.addItem(NSMenuItem.separator())
@@ -504,6 +508,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
         item.button?.title = "🐳"
         let menu = NSMenu()
         menu.addItem(NSMenuItem(title: "🎬 播放动作", action: #selector(playMotion), keyEquivalent: ""))
+        menu.addItem(NSMenuItem(title: "🆕 开新会话", action: #selector(newSession), keyEquivalent: ""))
         menu.addItem(NSMenuItem(title: "⚙️ 设置大小", action: #selector(openSettings), keyEquivalent: ","))
         menu.addItem(NSMenuItem(title: "回到右下角", action: #selector(resetPos), keyEquivalent: ""))
         menu.addItem(NSMenuItem(title: "退出", action: #selector(quit), keyEquivalent: "q"))
@@ -513,12 +518,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
 
     @objc func playMotion() {
         // 通过 JS 触发随机动作 (测试/菜单触发)；走 __setMotion 以遵守说话锁定
-        let groups = ["selfie", "ketchup", "bubble", "splash", "openLid", "aidale"]
+        let groups = ["selfie", "ketchup", "bubble", "splash", "openLid", "aidale", "wave", "heartKiss", "headpat", "tailWag", "bellyUp", "sleep", "stretch", "dance", "hop", "angryPuff", "worship", "coolShades", "catPaws", "bunnyEars", "peek", "coffee"]
         let g = groups[Int.random(in: 0..<groups.count)]
         let js = "try { window.__setMotion ? window.__setMotion('\(g)') : window.__petModel.motion('\(g)', 0, 3); 'ok' } catch(e) { 'err:' + e.message }"
         webView.evaluateJavaScript(js) { result, err in
             self.handleJSEvent("MENU_MOTION: \(g) -> \(result ?? "nil") err=\(String(describing: err))")
         }
+    }
+
+    private func freshSessionID() -> String {
+        "pet-" + UUID().uuidString.replacingOccurrences(of: "-", with: "").lowercased()
+    }
+
+    @objc func newSession() {
+        let d = UserDefaults.standard
+        let sid = freshSessionID()
+        d.set(sid, forKey: "pet_sessionId")
+        d.set(0.0, forKey: "pet_lastExchangeAt")
+        let timeout = loadConfig().sessionIdleTimeoutMinutes * 60
+        handleJSEvent("SESSION_NEW sid=\(sid) reason=manual idle=0s timeout=\(timeout)s")
+        showBubble("新会话开始～")
     }
 
     @objc func resetPos() {
@@ -898,6 +917,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
         markActivity()
         isAIReplying = true
         let cfg = loadConfig()
+        let defaults = UserDefaults.standard
+        let now = Date().timeIntervalSince1970
+        let timeoutSeconds = max(0, cfg.sessionIdleTimeoutMinutes * 60)
+        let storedSessionID = defaults.string(forKey: "pet_sessionId") ?? ""
+        let lastExchangeAt = defaults.double(forKey: "pet_lastExchangeAt")
+        let idleSeconds = lastExchangeAt > 0 ? max(0, Int(now - lastExchangeAt)) : 0
+        let shouldCreate = storedSessionID.isEmpty || timeoutSeconds == 0 || lastExchangeAt <= 0 || now - lastExchangeAt > Double(timeoutSeconds)
+        let sessionID: String
+        if shouldCreate {
+            sessionID = freshSessionID()
+            defaults.set(sessionID, forKey: "pet_sessionId")
+            let reason = storedSessionID.isEmpty || lastExchangeAt <= 0 ? "empty" : "timeout"
+            handleJSEvent("SESSION_NEW sid=\(sessionID) reason=\(reason) idle=\(idleSeconds)s timeout=\(timeoutSeconds)s")
+        } else {
+            sessionID = storedSessionID
+            handleJSEvent("SESSION_REUSE sid=\(sessionID) idle=\(idleSeconds)s timeout=\(timeoutSeconds)s")
+        }
         // 决定 baseURL / key / model
         var baseURL = cfg.apiBaseURL
         var apiKey = cfg.apiKey
@@ -924,6 +960,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
         req.httpMethod = "POST"
         req.timeoutInterval = 60
         req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        req.setValue(sessionID, forHTTPHeaderField: "X-Hermes-Session-Id")
         if !apiKey.isEmpty {
             req.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
         }
@@ -932,7 +969,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
 
         【可用的工具】
         - set_emotion(emotion): 情绪表情，可选值：开心、悲伤、生气、害羞、惊讶、疑惑、疲惫、调皮、无语、心动、星星眼、爱心眼、晕、哭、发呆（每次回复必须调用一次，选最贴切的）
-        - play_motion(motion): 身体动作，可选值：待机、撒娇、自拍、简单自拍、番茄酱、开盖、吹泡泡、喷水、爬动（只在需要明显身体动作时调用）
+        - play_motion(motion): 身体动作，可选值：待机、撒娇、自拍、简单自拍、番茄酱、开盖、吹泡泡、喷水、爬动、招手、比心、摸头、摇尾巴、露肚皮、睡觉、伸懒腰、跳舞、蹦跳、生气鼓脸、崇拜、墨镜、猫爪、兔耳、探头、喝咖啡（只在需要明显身体动作时调用）
         - move_window(x, y): 移动窗口，x/y 为 0-100 百分比（需要走动/找我时调用；“找我”可用 direction 参数，移动到用户常驻位置，例如右下角或屏幕中央附近）
         - open_chat(): 弹出文本输入框让主人打字对话（主人要求打字/打开输入框时调用）
         - open_settings(): 打开设置面板（主人要改配置/API/大小/音色/开关时调用）
@@ -957,7 +994,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
                             "motion": [
                                 "type": "string",
                                 "description": "要播放的身体动作",
-                                "enum": ["待机", "撒娇", "自拍", "简单自拍", "番茄酱", "开盖", "吹泡泡", "喷水", "爬动"]
+                                "enum": ["待机", "撒娇", "自拍", "简单自拍", "番茄酱", "开盖", "吹泡泡", "喷水", "爬动", "招手", "比心", "摸头", "摇尾巴", "露肚皮", "睡觉", "伸懒腰", "跳舞", "蹦跳", "生气鼓脸", "崇拜", "墨镜", "猫爪", "兔耳", "探头", "喝咖啡"]
                             ]
                         ],
                         "required": ["motion"],
@@ -1074,6 +1111,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
                     self.showBubble("⚠️ API 返回异常: \(raw.prefix(150))")
                     return
                 }
+                if let serverID = (resp as? HTTPURLResponse)?.value(forHTTPHeaderField: "X-Hermes-Session-Id"), !serverID.isEmpty {
+                    if serverID != sessionID { self.handleJSEvent("SESSION_SERVER_ID old=\(sessionID) new=\(serverID)") }
+                    UserDefaults.standard.set(serverID, forKey: "pet_sessionId")
+                }
+                UserDefaults.standard.set(Date().timeIntervalSince1970, forKey: "pet_lastExchangeAt")
                 // 标准 tools 响应中 content 允许为 null；工具调用和正文分别解析。
                 var text = (msg["content"] as? String) ?? ""
                 var emotion: String? = nil
@@ -1090,6 +1132,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
                     "splash": "splash", "喷水": "splash",
                     "crawl": "crawl", "爬动": "crawl", "游动": "crawl",
                     "talk": "talk", "说话": "talk", "讲话": "talk"
+                    , "wave": "wave", "招手": "wave", "打招呼": "wave"
+                    , "heartkiss": "heartKiss", "比心": "heartKiss"
+                    , "headpat": "headpat", "摸头": "headpat"
+                    , "tailwag": "tailWag", "摇尾巴": "tailWag"
+                    , "bellyup": "bellyUp", "露肚皮": "bellyUp"
+                    , "sleep": "sleep", "睡觉": "sleep"
+                    , "stretch": "stretch", "伸懒腰": "stretch"
+                    , "dance": "dance", "跳舞": "dance"
+                    , "hop": "hop", "蹦跳": "hop"
+                    , "angrypuff": "angryPuff", "生气鼓脸": "angryPuff"
+                    , "worship": "worship", "崇拜": "worship"
+                    , "coolshades": "coolShades", "墨镜": "coolShades"
+                    , "catpaws": "catPaws", "猫爪": "catPaws"
+                    , "bunnyears": "bunnyEars", "兔耳": "bunnyEars"
+                    , "peek": "peek", "探头": "peek"
+                    , "coffee": "coffee", "喝咖啡": "coffee"
                 ]
                 let validEmotions: Set<String> = ["开心", "悲伤", "生气", "害羞", "惊讶", "疑惑", "疲惫", "调皮", "无语", "心动", "星星眼", "爱心眼", "晕", "哭", "发呆"]
                 let toolCalls = msg["tool_calls"] as? [[String: Any]] ?? []
@@ -1379,8 +1437,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
             // ———— Task 3: 20% 概率用卖萌动作代替本次漫游 ————
             if Int.random(in: 0..<5) == 0 {
                 let gestures = [
-                    ("吐舌", "bubble"), ("爱心眼", "aidale"),
-                    ("开心", "selfieQuick"), ("发呆", "openLid"), ("星星眼", "ketchup")
+                    ("吐舌", "bubble"), ("爱心眼", "heartKiss"), ("开心", "hop"),
+                    ("发呆", "peek"), ("星星眼", "worship"), ("害羞", "headpat"),
+                    ("调皮", "catPaws"), ("疲惫", "stretch"), ("开心", "dance")
                 ]
                 let gesture = gestures.randomElement()!
                 self.playReaction(emotion: gesture.0, motion: gesture.1)
@@ -1839,8 +1898,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
         alert.addButton(withTitle: "取消")
 
         // 垂直排列的输入区
-        let box = NSView(frame: NSRect(x: 0, y: 0, width: 380, height: 464))
-        var y: CGFloat = 444
+        let box = NSView(frame: NSRect(x: 0, y: 0, width: 380, height: 518))
+        var y: CGFloat = 498
 
         func addLabel(_ text: String) {
             let l = NSTextField(labelWithString: text)
@@ -1908,6 +1967,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
         addLabel("模型名")
         let modelField = addField(cfg.model, placeholder: "hermes-token / grok / deepseek-chat")
 
+        addLabel("会话空闲超时（分钟，0=每条新会话）")
+        let timeoutField = addField(String(cfg.sessionIdleTimeoutMinutes), placeholder: "30")
+
         addLabel("角色提示词 (人设/语气)")
         let promptField = NSTextView(frame: NSRect(x: 0, y: y - 88, width: 380, height: 88))
         promptField.string = cfg.systemPrompt
@@ -1936,6 +1998,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
             cfg.apiKey = keyField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
             cfg.model = modelField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
             cfg.systemPrompt = promptField.string
+            cfg.sessionIdleTimeoutMinutes = max(0, Int(timeoutField.stringValue) ?? 30)
             self.saveConfig(cfg)
             UserDefaults.standard.set(speakCheck.state == .on, forKey: "pet_speak")
             UserDefaults.standard.set(wanderCheck.state == .on, forKey: "pet_wander")

@@ -1,0 +1,104 @@
+{
+  "Version": 3,
+  "Meta": {
+    "Duration": 3.2,
+    "Fps": 30,
+    "Loop": false,
+    "AreBeziersRestricted": true,
+    "CurveCount": 5,
+    "TotalSegmentCount": 16,
+    "TotalPointCount": 21,
+    "UserDataCount": 0,
+    "TotalUserDataSize": 0
+  },
+  "Curves": [
+    {
+      "Target": "Parameter",
+      "Id": "danbaofan",
+      "Segments": [
+        0,
+        1,
+        0,
+        0.4,
+        1,
+        0,
+        3.2,
+        0
+      ]
+    },
+    {
+      "Target": "Parameter",
+      "Id": "danbaoX",
+      "Segments": [
+        0,
+        -0.5,
+        0,
+        0.8,
+        0.2,
+        0,
+        1.6,
+        -0.2,
+        0,
+        2.4,
+        0.3,
+        0,
+        3.2,
+        0
+      ]
+    },
+    {
+      "Target": "Parameter",
+      "Id": "danbaoY",
+      "Segments": [
+        0,
+        0.3,
+        0,
+        0.8,
+        -0.2,
+        0,
+        1.6,
+        0.3,
+        0,
+        2.4,
+        -0.2,
+        0,
+        3.2,
+        0
+      ]
+    },
+    {
+      "Target": "Parameter",
+      "Id": "ParamCheek21",
+      "Segments": [
+        0,
+        1,
+        0,
+        0.6,
+        0.2,
+        0,
+        1.4,
+        1,
+        0,
+        3.2,
+        0
+      ]
+    },
+    {
+      "Target": "Parameter",
+      "Id": "ParamMouthOpenY",
+      "Segments": [
+        0,
+        0.8,
+        0,
+        0.6,
+        0.2,
+        0,
+        1.4,
+        0.8,
+        0,
+        3.2,
+        0
+      ]
+    }
+  ]
+}
