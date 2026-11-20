@@ -14,7 +14,7 @@
     3 = InverseStepped -> type, time, value       (3 个数)
   - 时间必须非递减, 且在 [0, Meta.Duration] 内
   - 解析结束后必须正好消费完整个数组（多/少一个数都算错）
-  - Curve 的 Id 必须是模型真实存在的参数 (从 cdi3 + 现有 motion 出现过的参数集合推断)
+  - Curve 的参数 Id 以 cdi3 为权威；清单外 Id 会明确告警来源文件
 
 ⚠️ 常见错误：把 Segments 写成裸 time/value 对 (如 [0,10,0.55,12,...])。
    Cubism 运行时会静默忽略该曲线（动作不生效但不报错）——本脚本会直接报错。
@@ -40,17 +40,6 @@ def known_params():
     except Exception as e:  # pragma: no cover
         print(f"WARN: 无法读取 cdi3 ({e})，参数名不做校验")
         return None
-    # cdi3 不含所有参数, 用现有 motion 里出现过的 Id 补充
-    for name in os.listdir(MOTION_DIR):
-        if not name.endswith(".motion3.json"):
-            continue
-        try:
-            d = json.load(open(os.path.join(MOTION_DIR, name), encoding="utf-8"))
-            for c in d.get("Curves", []):
-                if c.get("Target") == "Parameter":
-                    ids.add(c["Id"])
-        except Exception:
-            pass
     return ids
 
 
@@ -78,12 +67,13 @@ def check_motion(path, params):
         warns.append(f"Meta.Fps={meta.get('Fps')}")
 
     total_segs = 0
+    total_points = 0
     for idx, c in enumerate(curves):
         cid = c.get("Id", f"#{idx}")
         if c.get("Target") not in ("Parameter", "Model"):
             errs.append(f"[{cid}] Target 非法: {c.get('Target')!r}")
         if c.get("Target") == "Parameter" and params is not None and cid not in params:
-            errs.append(f"[{cid}] 参数在模型中不存在 (拼错就不会动)")
+            warns.append(f"[{cid}] 不在权威 cdi3 参数集中；来源文件: {os.path.basename(path)}")
         s = c.get("Segments")
         if not isinstance(s, list) or len(s) < 2:
             errs.append(f"[{cid}] Segments 缺失/过短")
@@ -94,7 +84,7 @@ def check_motion(path, params):
         t_prev, v_prev = s[0], s[1]
         if not (0 <= t_prev <= dur + 1e-6):
             errs.append(f"[{cid}] 首点时间 {t_prev} 越界 [0,{dur}]")
-        i, segs = 2, 0
+        i, segs, points = 2, 0, 1
         while i < len(s):
             t = s[i]
             if t not in (0, 1, 2, 3):
@@ -107,20 +97,36 @@ def check_motion(path, params):
             if i + need > len(s):
                 errs.append(f"[{cid}] 位置 {i} 段被截断 (类型 {int(t)} 需 {need} 个数)")
                 break
-            tt, vv = s[i + 1], s[i + 2]
-            if tt < t_prev - 1e-9:
-                errs.append(f"[{cid}] 时间倒退 {t_prev} -> {tt}")
-            if not (0 <= tt <= dur + 1e-6):
-                errs.append(f"[{cid}] 时间 {tt} 越界 [0,{dur}]")
-            t_prev = tt
+            if int(t) == 1:
+                c1t, _, c2t, _, end_t, _ = s[i + 1:i + 7]
+                if not (t_prev - 1e-9 <= c1t <= c2t <= end_t <= dur + 1e-6):
+                    errs.append(
+                        f"[{cid}] Bezier 时间非法: prev={t_prev}, c1={c1t}, "
+                        f"c2={c2t}, end={end_t}, Duration={dur}"
+                    )
+                if c1t < -1e-9 or c2t < -1e-9 or end_t < -1e-9:
+                    errs.append(f"[{cid}] Bezier 时间必须落在 [0,{dur}]")
+                t_prev = end_t
+                points += 3
+            else:
+                end_t = s[i + 1]
+                if end_t < t_prev - 1e-9:
+                    errs.append(f"[{cid}] 时间倒退 {t_prev} -> {end_t}")
+                if not (0 <= end_t <= dur + 1e-6):
+                    errs.append(f"[{cid}] 时间 {end_t} 越界 [0,{dur}]")
+                t_prev = end_t
+                points += 1
             i += need
             segs += 1
         else:
             total_segs += segs
+            total_points += points
         if i != len(s):
             errs.append(f"[{cid}] Segments 未正好消费完 (剩余 {len(s) - i} 个数)")
     if meta.get("TotalSegmentCount") not in (None, total_segs):
         errs.append(f"Meta.TotalSegmentCount={meta.get('TotalSegmentCount')} 实际={total_segs}")
+    if meta.get("TotalPointCount") != total_points:
+        errs.append(f"Meta.TotalPointCount={meta.get('TotalPointCount')} 实际={total_points}")
     return errs, warns
 
 
@@ -128,7 +134,7 @@ BLENDS = {"Add", "Multiply", "Overwrite", None}
 
 
 def check_expression(path, params):
-    errs = []
+    errs, warns = [], []
     try:
         d = json.load(open(path, encoding="utf-8"))
     except Exception as e:
@@ -142,12 +148,12 @@ def check_expression(path, params):
     for p in ps:
         pid = p.get("Id")
         if params is not None and pid not in params:
-            errs.append(f"[{pid}] 参数在模型中不存在")
+            warns.append(f"[{pid}] 不在权威 cdi3 参数集中；来源文件: {os.path.basename(path)}")
         if p.get("Blend") not in BLENDS:
             errs.append(f"[{pid}] Blend 非法: {p.get('Blend')!r}")
         if not isinstance(p.get("Value"), (int, float)):
             errs.append(f"[{pid}] Value 必须为数字")
-    return errs, []
+    return errs, warns
 
 
 def main(argv):
@@ -174,6 +180,8 @@ def main(argv):
                 d = json.load(open(path, encoding="utf-8"))
                 print(f"✅ {name}  dur={d['Meta']['Duration']}s curves={len(d['Curves'])}"
                       f" loop={d['Meta'].get('Loop')}{note}")
+            elif warns:
+                print(f"⚠️ {name}  " + "; ".join(warns))
     print(f"\n结果: {len(targets) - failed}/{len(targets)} 通过")
     return 1 if failed else 0
 

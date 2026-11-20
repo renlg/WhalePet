@@ -276,11 +276,12 @@ html, body {
     '哭': '哭', '哭泣': '哭', '大哭': '哭',
     '脸红': '脸红', '害羞': '脸红', '害羞': '脸红', '腼腆': '脸红',
     '星星': '星星眼', '崇拜': '星星眼', '星星眼': '星星眼', '期待': '星星眼',
-    '爱心': '爱心眼', '爱': '爱心眼', '喜欢': '爱心眼', '心动': '爱心眼',
+    '爱心': '爱心眼', '爱心眼': '爱心眼', '爱': '爱心眼', '喜欢': '爱心眼', '心动': '爱心眼',
     '晕': '晕晕', '晕晕': '晕晕', '头晕': '晕晕', '晕倒': '晕晕',
     '吐舌': '吐舌', '调皮': '调皮', '俏皮': '调皮', '淘气': '调皮',
     '吐魂': '吐魂', '累': '吐魂', '疲惫': '吐魂', '虚脱': '吐魂',
     '流汗': '流汗', '汗': '流汗', '尴尬': '流汗', '无奈': '流汗',
+    '无语': '流汗',
     '发呆': '呆呆眼', '呆': '呆呆眼', '懵': '呆呆眼', '迷茫': '呆呆眼',
     '问号': '问号', '疑惑': '问号', '疑问': '问号', '不解': '问号',
     '惊讶': '感叹号', '惊': '感叹号', '震惊': '感叹号', '吓': '感叹号',
@@ -297,6 +298,15 @@ html, body {
     '兴奋眨眼': 'excitedWink', '眨眼': 'excitedWink',
     '好吃': 'lickLipsYum', '舔嘴': 'lickLipsYum',
     '阴郁': 'gloomySulk', '闹别扭': 'gloomySulk',
+  }
+  const SWIFT_VALID_EMOTIONS = [
+    '开心', '悲伤', '生气', '害羞', '惊讶', '疑惑', '疲惫', '调皮', '无语', '心动',
+    '星星眼', '爱心眼', '晕', '哭', '发呆', '恶魔角', '天使', '猫耳爱心', '兔兔星星',
+    '耍帅', '花花爱心', '心跳脸红', '虚脱流汗', '晕眩', '兴奋眨眼', '舔嘴', '阴郁'
+  ]
+  const missingEmotionMappings = SWIFT_VALID_EMOTIONS.filter(emotion => !EXPR_MAP[emotion])
+  if (missingEmotionMappings.length) {
+    console.error('EMOTION_MAP_MISSING:', missingEmotionMappings.join(','))
   }
   const MOTION_MAP = {
     '开心': 'hop', '高兴': 'wave', '愉快': 'dance', '喜悦': 'hop',
@@ -318,28 +328,32 @@ html, body {
     'wave', 'heartKiss', 'headpat', 'tailWag', 'bellyUp', 'sleep', 'stretch', 'dance',
     'hop', 'angryPuff', 'worship', 'coolShades', 'catPaws', 'bunnyEars', 'peek', 'coffee'
   ])
-  window.__setMotion = function(group) {
+  async function releasePendingAfterTalkFailure() {
+    talking = false
+    const next = pendingAfterTalk
+    pendingAfterTalk = null
+    if (next) await window.__setMotion(next)
+  }
+  window.__setMotion = async function(group) {
     if (!MOTION_GROUPS.has(group)) {
       console.error('unknown motion group:', group)
-      return
+      return false
     }
     if (!model) {
       console.error('motion model not ready:', group)
-      return
+      return false
     }
     // 说话锁定: 语音结束前其他动作排队，__stopTalkingMotion 会放行。
     if (talking && group !== 'talk') {
       pendingAfterTalk = group
-      return
-    }
-    talking = group === 'talk'
-    if (talking) {
-      talkElapsed = 0
-      talkMotionElapsed = 0
+      return false
     }
     try {
-      model.motion(group, 0, 3)  // 3 = FORCE 优先级
-      if (group === 'talk') {
+      const played = await model.motion(group, 0, 3)  // 3 = FORCE 优先级
+      if (group === 'talk' && played === true) {
+        talking = true
+        talkElapsed = 0
+        talkMotionElapsed = 0
         try {
           const mm = model.internalModel.motionManager
           const cur = mm.currentMotion
@@ -347,9 +361,17 @@ html, body {
             + ' reserved=' + (mm.reserveExpression ? 'yes' : 'no'))
         } catch(e) { console.log('TALK_PLAY probe err: ' + e) }
       }
-      console.log('set motion:', group)
+      if (played === true) {
+        console.log('set motion:', group)
+        return true
+      }
+      console.error('set motion not played:', group)
+      if (group === 'talk') await releasePendingAfterTalkFailure()
+      return false
     } catch(e) {
       console.error('set motion error:', group, e)
+      if (group === 'talk') await releasePendingAfterTalkFailure()
+      return false
     }
   }
   window.__stopTalkingMotion = function() {
@@ -364,16 +386,22 @@ html, body {
   }
   // 静音/无可读文本仍保留短身体反馈，但不进入 speaking 状态；
   // beforeModelUpdate 会覆盖 motion 内的嘴部曲线并保持闭嘴。
-  window.__playSilentReplyMotion = function() {
-    if (!model) return
+  window.__playSilentReplyMotion = async function() {
+    if (!model) return false
     talking = false
     talkElapsed = 0
     talkMotionElapsed = 0
     pendingAfterTalk = null
     model.internalModel.coreModel.setParameterValueById('ParamMouthOpenY', 0)
-    model.motion('talk', 0, 3)
+    try {
+      return await model.motion('talk', 0, 3) === true
+    } catch(e) {
+      console.error('silent reply motion error:', e)
+      await releasePendingAfterTalkFailure()
+      return false
+    }
   }
-  window.__setEmotion = function(emotion) {
+  window.__setEmotion = async function(emotion) {
     if (!model) return
     const expr = EXPR_MAP[emotion] || EXPR_MAP[emotion.split('')[0]]
     // 未映射的情绪默认回 idle 待机 (避免残留上一个动作)
@@ -393,8 +421,9 @@ html, body {
         console.log('emotion motion:', emotion, '->', motion)
       } else {
         try {
-          model.motion(motion, 0, 3)
-          console.log('emotion motion:', emotion, '->', motion)
+          const played = await model.motion(motion, 0, 3)
+          if (played === true) console.log('emotion motion:', emotion, '->', motion)
+          else console.error('emotion motion not played:', emotion, '->', motion)
         } catch(e) {
           console.error('emotion motion error:', e)
         }

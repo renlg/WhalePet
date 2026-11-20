@@ -21,6 +21,7 @@ final class LocalHTTPServer {
     private var listener: NWListener?
     private let root: String
     private let port: UInt16
+    private let debugToken = UUID().uuidString.replacingOccurrences(of: "-", with: "").lowercased()
 
     init(root: String, port: UInt16) {
         self.root = root
@@ -31,16 +32,21 @@ final class LocalHTTPServer {
         do {
             let params = NWParameters.tcp
             params.allowLocalEndpointReuse = true
-            listener = try NWListener(using: params, on: NWEndpoint.Port(rawValue: port)!)
+            params.requiredLocalEndpoint = .hostPort(host: "127.0.0.1", port: NWEndpoint.Port(rawValue: port)!)
+            listener = try NWListener(using: params)
         } catch {
             print("HTTP server listen failed: \(error)")
             return false
         }
         listener?.newConnectionHandler = { [weak self] conn in
+            conn.stateUpdateHandler = { state in
+                if case .failed(let error) = state { print("HTTP connection failed: \(error)") }
+            }
             conn.start(queue: .global(qos: .userInitiated))
             self?.handle(conn)
         }
         listener?.start(queue: .global(qos: .userInitiated))
+        print("WhalePet debug token: \(debugToken)")
         return true
     }
 
@@ -56,11 +62,20 @@ final class LocalHTTPServer {
                 if let u = URL(string: path) { path = u.path }
             }
             if path == "/" { path = "/index.html" }
+            let requestURL = URLComponents(string: "http://127.0.0.1\(path)")
+            let cleanPath = requestURL?.path ?? path
+            if cleanPath.hasPrefix("/debug/"),
+               requestURL?.queryItems?.first(where: { $0.name == "token" })?.value != debugToken {
+                let body = "403 Forbidden"
+                let header = "HTTP/1.1 403 Forbidden\r\nContent-Type: text/plain\r\nContent-Length: \(body.utf8.count)\r\nConnection: close\r\n\r\n"
+                conn.send(content: Data((header + body).utf8), completion: .contentProcessed { _ in conn.cancel() })
+                return
+            }
             // 调试端点: GET /debug/speak?text=... 触发一次真实说话（用于验证口型动画）
             if path.hasPrefix("/debug/speak") {
                 var text = "调试说话测试，一二三四五六七八九十。"
-                if let q = path.components(separatedBy: "text=").dropFirst().first,
-                   let decoded = q.removingPercentEncoding, !decoded.isEmpty {
+                if let decoded = requestURL?.queryItems?.first(where: { $0.name == "text" })?.value,
+                   !decoded.isEmpty {
                     text = decoded
                 }
                 DispatchQueue.main.async {
@@ -76,14 +91,12 @@ final class LocalHTTPServer {
             if path.hasPrefix("/debug/ask") || path.hasPrefix("/debug/session") {
                 let isReset = path.hasPrefix("/debug/session")
                 var text = isReset ? "" : "调试消息"
-                if let q = path.components(separatedBy: "text=").dropFirst().first,
-                   let decoded = q.removingPercentEncoding, !decoded.isEmpty {
+                if let decoded = requestURL?.queryItems?.first(where: { $0.name == "text" })?.value,
+                   !decoded.isEmpty {
                     text = decoded
                 }
                 DispatchQueue.main.async {
                     if isReset {
-                        UserDefaults.standard.removeObject(forKey: "pet_sessionId")
-                        UserDefaults.standard.set(0.0, forKey: "pet_lastExchangeAt")
                         NotificationCenter.default.post(name: .init("WhalePetDebugSessionReset"), object: nil)
                     } else {
                         NotificationCenter.default.post(name: .init("WhalePetDebugAsk"),
@@ -312,6 +325,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
     var webView: WKWebView!
     var statusItem: NSStatusItem?
     var httpServer: LocalHTTPServer?
+    // These fields are confined to the main thread; UserDefaults is persistence only.
+    private var sessionID = UserDefaults.standard.string(forKey: "pet_sessionId") ?? ""
+    private var sessionGeneration = 0
+    private var lastSuccessfulExchange = UserDefaults.standard.double(forKey: "pet_lastExchangeAt")
+    private var sessionReservedAt: TimeInterval = 0
+    private let webLogQueue = DispatchQueue(label: "WhalePet.webview-log")
+    private var webLogHandle: FileHandle?
     // 尺寸设置: x1~x5, 当前为 x3 (400x560)
     var currentScale: Int = 3
     let baseSize = CGSize(width: 400.0 / 3.0, height: 560.0 / 3.0)  // x1 基准 ≈133x187
@@ -411,8 +431,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
         NotificationCenter.default.addObserver(
             forName: .init("WhalePetDebugSessionReset"), object: nil, queue: .main
         ) { [weak self] _ in
-            self?.handleJSEvent("DEBUG_SESSION_RESET")
-            self?.showBubble("🆕 会话已重置")
+            guard let self else { return }
+            self.resetSession(reason: "debug")
+            self.handleJSEvent("DEBUG_SESSION_RESET")
+            self.showBubble("🆕 会话已重置")
         }
         // 调试端点 GET /debug/speak?text=... 通过通知触发一次真实说话
         NotificationCenter.default.addObserver(
@@ -568,13 +590,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
     }
 
     @objc func newSession() {
-        let d = UserDefaults.standard
-        let sid = freshSessionID()
-        d.set(sid, forKey: "pet_sessionId")
-        d.set(0.0, forKey: "pet_lastExchangeAt")
+        resetSession(reason: "manual")
+        let sid = sessionID
         let timeout = loadConfig().sessionIdleTimeoutMinutes * 60
         handleJSEvent("SESSION_NEW sid=\(sid) reason=manual idle=0s timeout=\(timeout)s")
         showBubble("新会话开始～")
+    }
+
+    private func resetSession(reason: String) {
+        dispatchPrecondition(condition: .onQueue(.main))
+        sessionGeneration += 1
+        sessionID = freshSessionID()
+        lastSuccessfulExchange = 0
+        // Reservation prevents simultaneous first requests from creating separate sessions.
+        sessionReservedAt = Date().timeIntervalSince1970
+        let d = UserDefaults.standard
+        d.set(sessionID, forKey: "pet_sessionId")
+        d.set(0.0, forKey: "pet_lastExchangeAt")
+        handleJSEvent("SESSION_RESET sid=\(sessionID) generation=\(sessionGeneration) reason=\(reason)")
     }
 
     @objc func resetPos() {
@@ -950,27 +983,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
 
     // 调 AI (自定义 API 优先, 否则 Hermes gateway)
     func askHermes(_ text: String) {
+        dispatchPrecondition(condition: .onQueue(.main))
         let requestStartedAt = Date()
         markActivity()
         isAIReplying = true
         let cfg = loadConfig()
-        let defaults = UserDefaults.standard
         let now = Date().timeIntervalSince1970
         let timeoutSeconds = max(0, cfg.sessionIdleTimeoutMinutes * 60)
-        let storedSessionID = defaults.string(forKey: "pet_sessionId") ?? ""
-        let lastExchangeAt = defaults.double(forKey: "pet_lastExchangeAt")
-        let idleSeconds = lastExchangeAt > 0 ? max(0, Int(now - lastExchangeAt)) : 0
-        let shouldCreate = storedSessionID.isEmpty || timeoutSeconds == 0 || lastExchangeAt <= 0 || now - lastExchangeAt > Double(timeoutSeconds)
-        let sessionID: String
+        let activityAt = lastSuccessfulExchange > 0 ? lastSuccessfulExchange : sessionReservedAt
+        let idleSeconds = activityAt > 0 ? max(0, Int(now - activityAt)) : 0
+        let shouldCreate = sessionID.isEmpty || timeoutSeconds == 0 || activityAt <= 0 || now - activityAt > Double(timeoutSeconds)
         if shouldCreate {
-            sessionID = freshSessionID()
-            defaults.set(sessionID, forKey: "pet_sessionId")
-            let reason = storedSessionID.isEmpty || lastExchangeAt <= 0 ? "empty" : "timeout"
+            let reason = sessionID.isEmpty || activityAt <= 0 ? "empty" : "timeout"
+            resetSession(reason: reason)
             handleJSEvent("SESSION_NEW sid=\(sessionID) reason=\(reason) idle=\(idleSeconds)s timeout=\(timeoutSeconds)s")
         } else {
-            sessionID = storedSessionID
             handleJSEvent("SESSION_REUSE sid=\(sessionID) idle=\(idleSeconds)s timeout=\(timeoutSeconds)s")
         }
+        let requestSessionID = sessionID
+        let requestGeneration = sessionGeneration
         // 决定 baseURL / key / model
         var baseURL = cfg.apiBaseURL
         var apiKey = cfg.apiKey
@@ -997,7 +1028,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
         req.httpMethod = "POST"
         req.timeoutInterval = 60
         req.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        req.setValue(sessionID, forHTTPHeaderField: "X-Hermes-Session-Id")
+        req.setValue(requestSessionID, forHTTPHeaderField: "X-Hermes-Session-Id")
         if !apiKey.isEmpty {
             req.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
         }
@@ -1140,6 +1171,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
                     self.showBubble("⚠️ 网络错误: \(err.localizedDescription)")
                     return
                 }
+                guard let http = resp as? HTTPURLResponse,
+                      (200..<300).contains(http.statusCode) else {
+                    let status = (resp as? HTTPURLResponse)?.statusCode ?? -1
+                    self.showBubble("⚠️ API HTTP 错误: \(status)")
+                    return
+                }
                 guard let data, let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
                       let choices = json["choices"] as? [[String: Any]],
                       let first = choices.first,
@@ -1148,11 +1185,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
                     self.showBubble("⚠️ API 返回异常: \(raw.prefix(150))")
                     return
                 }
-                if let serverID = (resp as? HTTPURLResponse)?.value(forHTTPHeaderField: "X-Hermes-Session-Id"), !serverID.isEmpty {
-                    if serverID != sessionID { self.handleJSEvent("SESSION_SERVER_ID old=\(sessionID) new=\(serverID)") }
-                    UserDefaults.standard.set(serverID, forKey: "pet_sessionId")
+                if self.sessionGeneration == requestGeneration && self.sessionID == requestSessionID {
+                    if let serverID = http.value(forHTTPHeaderField: "X-Hermes-Session-Id"), !serverID.isEmpty {
+                        if serverID != requestSessionID { self.handleJSEvent("SESSION_SERVER_ID old=\(requestSessionID) new=\(serverID)") }
+                        self.sessionID = serverID
+                        UserDefaults.standard.set(serverID, forKey: "pet_sessionId")
+                    }
+                    self.lastSuccessfulExchange = Date().timeIntervalSince1970
+                    self.sessionReservedAt = self.lastSuccessfulExchange
+                    UserDefaults.standard.set(self.lastSuccessfulExchange, forKey: "pet_lastExchangeAt")
+                } else {
+                    self.handleJSEvent("SESSION_STALE_RESPONSE sid=\(requestSessionID) generation=\(requestGeneration) currentSid=\(self.sessionID) currentGeneration=\(self.sessionGeneration)")
                 }
-                UserDefaults.standard.set(Date().timeIntervalSince1970, forKey: "pet_lastExchangeAt")
                 // 标准 tools 响应中 content 允许为 null；工具调用和正文分别解析。
                 var text = (msg["content"] as? String) ?? ""
                 var emotion: String? = nil
@@ -2119,44 +2163,62 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
         NSApp.terminate(nil)
     }
 
-    // 调试: 监听 /tmp/pet_scale_cmd 文件, 内容为倍率数字 -> 应用 (便于自动化验证)
+    private func debugCommandDirectory() -> String? {
+        let fm = FileManager.default
+        guard let appSupport = fm.urls(for: .applicationSupportDirectory, in: .userDomainMask).first else { return nil }
+        let directory = appSupport.appendingPathComponent("WhalePet/debug", isDirectory: true)
+        do {
+            try fm.createDirectory(at: directory, withIntermediateDirectories: true,
+                                   attributes: [.posixPermissions: 0o700])
+            try fm.setAttributes([.posixPermissions: 0o700], ofItemAtPath: directory.path)
+            return directory.path
+        } catch {
+            handleJSEvent("DEBUG_DIR_ERROR: \(error.localizedDescription)")
+            return nil
+        }
+    }
+
+    // 调试: 监听用户私有 0700 目录中的命令文件 (便于自动化验证)
     var debugTimer: Timer?
     func startDebugScaleWatcher() {
+        guard let debugDirectory = debugCommandDirectory() else { return }
         debugTimer = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { [weak self] _ in
             guard let self else { return }
-            // 调试: 监听 /tmp/pet_emotion_cmd 文件, 内容为情绪词 -> 触发 __setEmotion
-            let emoPath = "/tmp/pet_emotion_cmd"
+            let emoPath = debugDirectory + "/pet_emotion_cmd"
             if let emoTxt = try? String(contentsOfFile: emoPath, encoding: .utf8) {
                 let emo = emoTxt.trimmingCharacters(in: .whitespacesAndNewlines)
                 if !emo.isEmpty {
                     try? FileManager.default.removeItem(atPath: emoPath)
-                    let js = "window.__setEmotion ? window.__setEmotion('\(emo)') : 0"
-                    self.webView.evaluateJavaScript(js, completionHandler: nil)
+                    self.webView.callAsyncJavaScript(
+                        "return window.__setEmotion ? window.__setEmotion(emotion) : false",
+                        arguments: ["emotion": emo], in: nil, in: .page,
+                        completionHandler: nil)
                     self.handleJSEvent("DEBUG_EMOTION: \(emo)")
                 }
             }
-            // 调试: 监听 /tmp/pet_motion_cmd 文件, 内容为动作组名 -> 触发 __setMotion
-            let motionPath = "/tmp/pet_motion_cmd"
+            let motionPath = debugDirectory + "/pet_motion_cmd"
             if let motionTxt = try? String(contentsOfFile: motionPath, encoding: .utf8) {
                 let motionGroup = motionTxt.trimmingCharacters(in: .whitespacesAndNewlines)
                 if !motionGroup.isEmpty {
                     try? FileManager.default.removeItem(atPath: motionPath)
-                    let js = "window.__setMotion ? window.__setMotion('\(motionGroup)') : 0"
-                    self.webView.evaluateJavaScript(js, completionHandler: nil)
+                    self.webView.callAsyncJavaScript(
+                        "return window.__setMotion ? window.__setMotion(group) : false",
+                        arguments: ["group": motionGroup], in: nil, in: .page,
+                        completionHandler: nil)
                     self.handleJSEvent("DEBUG_MOTION: \(motionGroup)")
                 }
             }
-            // 调试: 监听 /tmp/pet_stats_cmd 文件, 内容=动作组名 -> 播放并 await 库结果（JS 侧 console.log 到 webview.log）
-            let statsPath = "/tmp/pet_stats_cmd"
+            let statsPath = debugDirectory + "/pet_stats_cmd"
             if let statsTxt = try? String(contentsOfFile: statsPath, encoding: .utf8) {
                 let groupArg = statsTxt.trimmingCharacters(in: .whitespacesAndNewlines)
                 try? FileManager.default.removeItem(atPath: statsPath)
                 self.handleJSEvent("MOTION_TEST_START: \(groupArg)")
-                let js = "window.__motionTest ? window.__motionTest('\(groupArg)') : 0"
-                self.webView.evaluateJavaScript(js, completionHandler: nil)
+                self.webView.callAsyncJavaScript(
+                    "return window.__motionTest ? window.__motionTest(group) : false",
+                    arguments: ["group": groupArg], in: nil, in: .page,
+                    completionHandler: nil)
             }
-            // 调试: 监听 /tmp/pet_move_cmd 文件, 内容为 "x% y%" -> moveWindow (触发 crawl 爬动)
-            let movePath = "/tmp/pet_move_cmd"
+            let movePath = debugDirectory + "/pet_move_cmd"
             if let moveTxt = try? String(contentsOfFile: movePath, encoding: .utf8) {
                 let moveVal = moveTxt.trimmingCharacters(in: .whitespacesAndNewlines)
                 if !moveVal.isEmpty, let target = self.moveTarget(fromTag: moveVal) {
@@ -2164,7 +2226,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
                     self.moveWindow(xPercent: target.0, yPercent: target.1, reason: "DEBUG_MOVE", duration: 2.6)
                 }
             }
-            let path = "/tmp/pet_scale_cmd"
+            let path = debugDirectory + "/pet_scale_cmd"
             guard let txt = try? String(contentsOfFile: path, encoding: .utf8) else { return }
             let trimmed = txt.trimmingCharacters(in: .whitespacesAndNewlines)
             guard let n = Int(trimmed), n >= 1, n <= 5 else { return }
@@ -2194,17 +2256,28 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
     }
 
     func handleJSEvent(_ event: String) {
-        // 写日志文件
         let line = "[\(Date())] \(event)\n"
-        if let data = line.data(using: .utf8) {
+        guard let data = line.data(using: .utf8) else { return }
+        webLogQueue.async { [weak self] in
+            guard let self else { return }
             let path = "/tmp/whale_pet_live2d/webview.log"
-            if let fh = FileHandle(forWritingAtPath: path) {
-                fh.seekToEndOfFile()
-                fh.write(data)
-                try? fh.close()
-            } else {
-                try? data.write(to: URL(fileURLWithPath: path))
+            let fm = FileManager.default
+            try? fm.createDirectory(atPath: (path as NSString).deletingLastPathComponent,
+                                    withIntermediateDirectories: true)
+            let size = ((try? fm.attributesOfItem(atPath: path)[.size]) as? NSNumber)?.uint64Value ?? 0
+            if size + UInt64(data.count) > 5 * 1024 * 1024 {
+                try? self.webLogHandle?.close()
+                self.webLogHandle = nil
+                let first = path + ".1"
+                try? fm.removeItem(atPath: first)
+                if fm.fileExists(atPath: path) { try? fm.moveItem(atPath: path, toPath: first) }
             }
+            if self.webLogHandle == nil {
+                if !fm.fileExists(atPath: path) { fm.createFile(atPath: path, contents: nil) }
+                self.webLogHandle = FileHandle(forWritingAtPath: path)
+                _ = try? self.webLogHandle?.seekToEnd()
+            }
+            try? self.webLogHandle?.write(contentsOf: data)
         }
     }
 
