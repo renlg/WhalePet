@@ -54,6 +54,8 @@ final class LocalHTTPServer {
             withIntermediateDirectories: true,
             attributes: [.posixPermissions: 0o700])
         try? debugToken.write(toFile: tokenPath, atomically: true, encoding: .utf8)
+        // 文件级权限收到 0600: 目录 0700 已挡住他人, 但 atomic write 会重置文件权限
+        try? FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: tokenPath)
         print("WhalePet debug token: \(debugToken)")
         return true
     }
