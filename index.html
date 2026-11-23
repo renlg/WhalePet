@@ -77,6 +77,11 @@ html, body {
   var talkElapsed = 0
   var talkMotionElapsed = 0
   var pendingAfterTalk = null   // 说话期间排队的动作, 说完后播放
+  var currentGroup = null       // 当前正在播放的动作组 (用于 bubble/talk 互斥检查)
+  // 吹泡泡嘴部参数 (cdi3 ParamGroup28「吹泡泡糖」), 与 ParamMouthOpenY 完全独立
+  const BUBBLE_PARAM_IDS = ['chuipaopao', 'chuipaopao1', 'chuipaopao2', 'chuipaopao3',
+                            'chuipaopao4', 'chuipaopao5', 'chuipaopao6', 'chuipaopao7']
+  const TALK_SAFETY_TIMEOUT_S = 30  // talking 卡死兜底 (正常语音 ≤20s)
   // 模型原始尺寸 (scale=1 时的尺寸, 固定值)
   // 注意: model.width 是"显示宽度", 会随 scale 变化, 不能用来算 scale (会形成反馈循环导致模型忽大忽小)
   let MW = 0
@@ -132,10 +137,28 @@ html, body {
       if (!talking) {
         // 其他 motion/expression 也可能包含嘴部曲线；非说话状态一律强制闭嘴。
         model.internalModel.coreModel.setParameterValueById('ParamMouthOpenY', 0)
+        // 不在 bubble 动作却残留泡泡嘴参数时(淡出过渡/别的动作串味)强制归零，
+        // 保证"吹泡泡时专心吹泡泡、不吹泡泡时绝不留泡泡嘴"。
+        if (currentGroup !== 'bubble') {
+          for (let i = 0; i < BUBBLE_PARAM_IDS.length; i++) {
+            try { model.internalModel.coreModel.setParameterValueById(BUBBLE_PARAM_IDS[i], 0) } catch(e) {}
+          }
+        }
         return
+      }
+      // 说话中: 泡泡嘴参数必须全归零 (talk 张嘴只走 ParamMouthOpenY)
+      for (let i = 0; i < BUBBLE_PARAM_IDS.length; i++) {
+        try { model.internalModel.coreModel.setParameterValueById(BUBBLE_PARAM_IDS[i], 0) } catch(e) {}
       }
       talkElapsed += app.ticker.deltaMS / 1000
       talkMotionElapsed += app.ticker.deltaMS / 1000
+      // 兜底: Swift 侧的 didFinish/didCancel 偶发丢失会让 talking 永久卡住,
+      // 导致所有动作被无限排队。正常语音最长 20s 左右, 30s 视为异常强制退出。
+      if (talkElapsed > TALK_SAFETY_TIMEOUT_S) {
+        console.log('TALK_SAFETY_TIMEOUT: talking stuck ' + talkElapsed.toFixed(1) + 's, force stop')
+        window.__stopTalkingMotion()
+        return
+      }
       const mouthOpen = 0.2 + 0.8 * Math.abs(Math.sin(talkElapsed * Math.PI * 4.5))
       const cm = model.internalModel.coreModel
       cm.setParameterValueById('ParamMouthOpenY', mouthOpen)
@@ -334,6 +357,19 @@ html, body {
     pendingAfterTalk = null
     if (next) await window.__setMotion(next)
   }
+  // 吹泡泡动作是否仍在播。bubble 是 Loop=true 的循环动作，
+  // 会一直循环到被别的动作替换，因此只需看 currentGroup。
+  function isBubbleActive() {
+    return currentGroup === 'bubble'
+  }
+  // 吹泡泡时嘴部由 chuipaopao*/chuipaopao3/4 这 8 个独立参数驱动(见 cdi3),
+  // 与 ParamMouthOpenY 无关。说话前若仍在吹泡泡, 必须先退回 idle 并复位嘴部。
+  function clearBubbleMouth() {
+    const cm = model.internalModel.coreModel
+    for (const id of BUBBLE_PARAM_IDS) {
+      try { cm.setParameterValueById(id, 0) } catch(e) {}
+    }
+  }
   window.__setMotion = async function(group) {
     if (!MOTION_GROUPS.has(group)) {
       console.error('unknown motion group:', group)
@@ -347,6 +383,14 @@ html, body {
     if (talking && group !== 'talk') {
       pendingAfterTalk = group
       return false
+    }
+    // talk 前置检查: 正在吹泡泡时不能直接张嘴说话(会变成边吹泡泡边张嘴)。
+    // 先把泡泡嘴收掉并退回 idle, 再播 talk。
+    if (group === 'talk' && isBubbleActive()) {
+      console.log('TALK_DEFER: bubble active -> clear mouth, back to idle')
+      clearBubbleMouth()
+      currentGroup = null
+      try { await model.motion('idle', 0, 3) } catch(e) {}
     }
     try {
       const played = await model.motion(group, 0, 3)  // 3 = FORCE 优先级
@@ -362,6 +406,7 @@ html, body {
         } catch(e) { console.log('TALK_PLAY probe err: ' + e) }
       }
       if (played === true) {
+        currentGroup = group
         console.log('set motion:', group)
         return true
       }
@@ -382,6 +427,7 @@ html, body {
     model.internalModel.coreModel.setParameterValueById('ParamMouthOpenY', 0)
     const next = pendingAfterTalk || 'idle'
     pendingAfterTalk = null
+    currentGroup = null
     window.__setMotion(next)
   }
   // 静音/无可读文本仍保留短身体反馈，但不进入 speaking 状态；
@@ -392,6 +438,8 @@ html, body {
     talkElapsed = 0
     talkMotionElapsed = 0
     pendingAfterTalk = null
+    currentGroup = null
+    clearBubbleMouth()
     model.internalModel.coreModel.setParameterValueById('ParamMouthOpenY', 0)
     try {
       return await model.motion('talk', 0, 3) === true
