@@ -2,7 +2,8 @@
 # WhalePet 打包脚本 — 保证素材完整
 set -euo pipefail
 
-SRC="/tmp/whale_pet_live2d"
+# 仓库根 = 本脚本所在目录 (不硬编码路径, 便于搬移)
+SRC="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 APP="$HOME/Desktop/WhalePet.app"
 SDK="/Library/Developer/CommandLineTools/SDKs/MacOSX26.sdk"
 export CLANG_MODULE_CACHE_PATH=/tmp/whalepet-clang-cache

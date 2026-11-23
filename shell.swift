@@ -11,7 +11,7 @@ let RESOURCE_DIR: String = {
     if let res = Bundle.main.resourcePath {
         return res  // .app/Contents/Resources
     }
-    return "/tmp/whale_pet_live2d"
+    return NSString(string: "~/workspace/whale-pet").expandingTildeInPath
 }()
 let SERVER_PORT: UInt16 = 8977
 
@@ -2270,7 +2270,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
         guard let data = line.data(using: .utf8) else { return }
         webLogQueue.async { [weak self] in
             guard let self else { return }
-            let path = "/tmp/whale_pet_live2d/webview.log"
+            // 日志放 ~/Library/Logs/WhalePet (macOS 标准日志位, 不受 /tmp 定期清理影响)
+            let logDir = NSString(string: "~/Library/Logs/WhalePet").expandingTildeInPath
+            let path = (logDir as NSString).appendingPathComponent("webview.log")
             let fm = FileManager.default
             try? fm.createDirectory(atPath: (path as NSString).deletingLastPathComponent,
                                     withIntermediateDirectories: true)
