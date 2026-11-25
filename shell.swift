@@ -15,6 +15,50 @@ let RESOURCE_DIR: String = {
 }()
 let SERVER_PORT: UInt16 = 8977
 
+/// 给模型注入"现在是几点"的上下文。
+/// 桌宠是长期运行的进程, 时间必须每次请求现算 —— 缓存会随时间漂移。
+/// 时区/星期/季节都用系统本地设置, 不写死 Asia/Shanghai。
+enum WhalePetClock {
+    static func nowContext(now: Date = Date()) -> String {
+        let cal = Calendar.current
+        let c = cal.dateComponents([.year, .month, .day, .hour, .minute, .weekday], from: now)
+        let weekday = ["周日", "周一", "周二", "周三", "周四", "周五", "周六"][safe: (c.weekday ?? 1) - 1] ?? ""
+        let month = c.month ?? 1
+        let day = c.day ?? 1
+        let season: String
+        switch month {
+        case 3...5: season = "春"
+        case 6...8: season = "夏"
+        case 9...11: season = "秋"
+        default: season = "冬"
+        }
+        let hour = c.hour ?? 0
+        let partOfDay: String
+        switch hour {
+        case 5..<9: partOfDay = "清晨"
+        case 9..<12: partOfDay = "上午"
+        case 12..<14: partOfDay = "中午"
+        case 14..<18: partOfDay = "下午"
+        case 18..<23: partOfDay = "晚上"
+        default: partOfDay = "深夜"
+        }
+        let tz = TimeZone.current.identifier
+        let stamp = String(
+            format: "%d年%d月%d日 %@ %02d:%02d",
+            c.year ?? 0, month, day, weekday, hour, c.minute ?? 0)
+        return """
+        【当前时间】\(stamp)（\(partOfDay)，\(season)季，时区 \(tz)）
+        回答和"今天/现在/几号/星期几/今年"有关的问题时，一律以上面这行时间为准，不要说没有时间或没有日历。时间紧迫感、节日问候、季节话题也参考它。
+        """
+    }
+}
+
+extension Array {
+    subscript(safe index: Int) -> Element? {
+        indices.contains(index) ? self[index] : nil
+    }
+}
+
 // 简单 HTTP 静态文件 server (Network.framework)
 // 用于给 WebView 提供本地 Live2D 页面, 避免 file:// CORS 限制
 final class LocalHTTPServer {
@@ -1223,7 +1267,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
             req.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
         }
         let systemPrompt = cfg.systemPrompt.isEmpty ? "你是一只可爱的鲸鱼娘桌宠, 用简短可爱的语气回答, 不超过80字, 可以带颜文字。" : cfg.systemPrompt
-        let fullPrompt = systemPrompt + """
+        // ⚠️ 必须把当前时间注入 system prompt。
+        // 之前完全没给时间, 模型只能靠训练数据猜, 答"今天几号"必然是错的
+        // (实测它会回"我这个小鲸鱼没有日历功能呀")。
+        // 每次请求重新生成, 不能缓存 —— 桌宠可能连开好几天。
+        let nowText = WhalePetClock.nowContext()
+        let fullPrompt = nowText + "\n\n" + systemPrompt + """
 
         【可用的工具】
         - set_emotion(emotion): 情绪表情，可选值：开心、悲伤、生气、害羞、惊讶、疑惑、疲惫、调皮、无语、心动、星星眼、爱心眼、晕、哭、发呆、恶魔角、天使、猫耳爱心、兔兔星星、耍帅、花花爱心、心跳脸红、虚脱流汗、晕眩、兴奋眨眼、舔嘴、阴郁（每次回复必须调用一次，选最贴切的）
