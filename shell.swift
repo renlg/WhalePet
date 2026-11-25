@@ -896,7 +896,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
             // 🎤 手动模式: 由输入框按钮触发, 监听期间不因 isInputOpen 而丢弃
             return !isAIReplying && !isSpeaking && !isUserDragging && !isRecording
         }
-        return voiceChatEnabled() && !isAIReplying && !isSpeaking && !isUserDragging && !isInputOpen && !isRecording
+        // ⚠️ 不能在这里判 isInputOpen: 麦克风按钮就在输入框里, 点它时输入框必定是开的,
+        // 判了就等于"用手动麦克风说话永远被丢弃"。设置面板自己会在 openSettings()
+        // 里主动停监听, 不需要这里再兜。
+        return (manual || voiceChatEnabled())
+            && !isAIReplying && !isSpeaking && !isUserDragging && !isRecording
     }
 
     private func checkVoiceChatSilence() {
@@ -906,7 +910,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
             voiceChatDiscardingInput = true
             return
         }
+        // 之前是"丢弃中 -> restart -> 下一轮又丢弃 -> 再 restart"的死循环:
+        // 重启会重置计时, 0.25s 的 timer 每轮都触发, 永远退不出去。
+        // 只有真的从"丢弃"回到"可接受"时重启一次, 然后清标记。
         if voiceChatDiscardingInput {
+            voiceChatDiscardingInput = false
             restartVoiceChatRecognition(after: 0.1)
             return
         }
@@ -926,9 +934,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
     }
 
     private func finishVoiceChatUtterance() {
+        let manual = voiceChatManualMode
         let text = voiceChatText.trimmingCharacters(in: .whitespacesAndNewlines)
+        let canProcess = voiceChatCanProcessInput(manual: manual)
         resetVoiceChatUtterance()
-        guard !text.isEmpty, voiceChatCanProcessInput(manual: voiceChatManualMode) else { return }
+        guard !text.isEmpty, canProcess else {
+            // 识别任务已经 final, 空结果就直接返回会留下"假监听"状态
+            // (isVoiceChatListening 还是 true 但 task 已死), 之后再也收不到任何结果。
+            // 必须换一个新 task。
+            restartVoiceChatRecognition(after: 0.1)
+            return
+        }
         // 用户话语已结束、AI 回复尚未开始；明确清掉任何遗留的 talk lock / 口型驱动。
         stopTalkingMotion()
         showBubble("你说: " + text)
@@ -938,8 +954,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
         isVoiceChatConversationActive = true
         askHermes(text)
         monitorVoiceChatReplyCompletion()
-        // 给每句话一个全新的识别请求，避免长时间任务被 Speech 框架自动终止。
-        restartVoiceChatRecognition(after: 0.15)
+        // 回复期间不重建识别 (重建出来的会话只会丢弃输入); 由
+        // monitorVoiceChatReplyCompletion 在 TTS 播完后统一重启。
     }
 
     private func monitorVoiceChatReplyCompletion() {
@@ -964,10 +980,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
     private func restartVoiceChatRecognition(after delay: TimeInterval) {
         guard (voiceChatManualMode || voiceChatEnabled()), !isRecording else { return }
         let manual = voiceChatManualMode
-        let generation = voiceChatSessionGeneration
+        // 必须在 stop 之后取 generation —— stopVoiceChatRecognitionSession 会 +1,
+        // 先取再 stop 会让下面的相等判断永远为假, 延迟重启 100% 失效
+        // (这才是"说了没反应"的主因: 别处一旦丢弃过一次输入, 就再也恢复不了监听)。
         stopVoiceChatRecognitionSession(logStopped: false)
+        let generation = voiceChatSessionGeneration
         DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
-            guard let self, self.voiceChatSessionGeneration == generation else { return }  // 会话已作废
+            guard let self,
+                  self.voiceChatSessionGeneration == generation,
+                  (manual || self.voiceChatEnabled()),
+                  !self.isRecording else { return }
             self.beginVoiceChatRecognition(force: manual)
         }
     }

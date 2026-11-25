@@ -43,6 +43,9 @@ cat > "$APP/Contents/Info.plist" <<'PLISTEOF'
   <!-- 语音对话要用麦克风。缺这条 macOS 26 会直接 TCC 强杀进程
        (__TCC_CRASHING_DUE_TO_PRIVACY_VIOLATION__, SIGABRT) -->
   <key>NSMicrophoneUsageDescription</key><string>WhalePet 需要麦克风用于语音对话</string>
+  <!-- SFSpeechRecognizer.requestAuthorization 也需要用途声明,
+       缺了系统会静默拒绝语音识别授权 -->
+  <key>NSSpeechRecognitionUsageDescription</key><string>WhalePet 需要语音识别把你说的转换成文字</string>
 </dict>
 </plist>
 PLISTEOF
