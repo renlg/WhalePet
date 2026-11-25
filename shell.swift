@@ -435,6 +435,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
     weak var dragView: DragView?
     let speechSynthesizer = AVSpeechSynthesizer()
     var speechPlayer: AVPlayer?
+    var speechTimeObserver: Any?      // 边界时间观察者 (播放结束兜底)
     var speechProcess: Process?
     var ttsDaemonProcess: Process?
     var ttsDaemonInput: FileHandle?
@@ -1858,6 +1859,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
             input.write(data + Data([0x0a]))
         }
         speechPlayer?.pause()
+        // 先摘时间观察者再丢 player: 忘了摘会在旧 player 上泄漏回调,
+        // 而且 removeTimeObserver 必须在 player 还活着时调用。
+        if let obs = speechTimeObserver, let p = speechPlayer {
+            p.removeTimeObserver(obs)
+        }
+        speechTimeObserver = nil
         speechPlayer = nil
         if let observer = speechEndObserver {
             NotificationCenter.default.removeObserver(observer)
@@ -2011,18 +2018,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
                     queue: .main
                 ) { [weak self] _ in
                     guard let self, self.speechRequestID == requestID else { return }
-                    self.speechPlayer = nil
-                    if let observer = self.speechEndObserver {
-                        NotificationCenter.default.removeObserver(observer)
+                    self.finishCloudSpeech(requestID: requestID, output: output, reason: "didPlayToEnd")
+                }
+                // 兜底: AVPlayerItemDidPlayToEndTime 在播放器被替换/音频被系统中断时
+                // 有可能不投递 (实测 3 次 talking stuck 30s 都栽在这)。
+                // 用 AVPlayer 自带的时间观察者再兜一层, 到结尾回调必达。
+                if durationMs > 0 {
+                    let endTime = CMTime(seconds: durationMs / 1000, preferredTimescale: 1000)
+                    self.speechTimeObserver = self.speechPlayer?.addBoundaryTimeObserver(
+                        forTimes: [NSValue(time: endTime)], queue: .main
+                    ) { [weak self] in
+                        guard let self, self.speechRequestID == requestID else { return }
+                        self.finishCloudSpeech(requestID: requestID, output: output, reason: "boundary")
                     }
-                    self.speechEndObserver = nil
-                    if let observer = self.speechFailureObserver {
-                        NotificationCenter.default.removeObserver(observer)
-                    }
-                    self.speechFailureObserver = nil
-                    self.speechOutputPath = nil
-                    try? FileManager.default.removeItem(atPath: output)
-                    self.stopTalkingMotion()
                 }
                 self.speechFailureObserver = NotificationCenter.default.addObserver(
                     forName: .AVPlayerItemFailedToPlayToEndTime,
@@ -2201,6 +2209,33 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
         let estDuration = Double(Array(speechText).count) * estMsPerChar
         let typeJs = "window.__showBubble ? window.__showBubble('\(self.jsEscapedString(bubbleText))', \(Int(estDuration))) : 0"
         self.webView.evaluateJavaScript(typeJs, completionHandler: nil)
+    }
+
+    /// 云端 TTS 播完的统一收尾。必须幂等 —— 边界观察者和 didPlayToEnd 通知
+    /// 会各自触发一次, 重复调用不能出事, 也不能把下一次请求的状态清掉。
+    func finishCloudSpeech(requestID: UUID, output: String, reason: String) {
+        guard speechRequestID == requestID else { return }
+        // speechPlayer == nil 就是"已经收尾过了": 第一个到达的路径清空它,
+        // 第二个到达的直接返回。
+        guard speechPlayer != nil || speechEndObserver != nil || speechTimeObserver != nil else { return }
+        if let obs = speechTimeObserver, let p = speechPlayer {
+            p.removeTimeObserver(obs)
+        }
+        speechTimeObserver = nil
+        if let observer = speechEndObserver {
+            NotificationCenter.default.removeObserver(observer)
+        }
+        speechEndObserver = nil
+        if let observer = speechFailureObserver {
+            NotificationCenter.default.removeObserver(observer)
+        }
+        speechFailureObserver = nil
+        speechPlayer = nil
+        speechOutputPath = nil
+        try? FileManager.default.removeItem(atPath: output)
+        // 关键: 一定要复位 talking, 否则嘴冻住并且所有动作被排队 30s
+        stopTalkingMotion()
+        handleJSEvent("SPEECH_END: reason=\(reason)")
     }
 
     func speechSynthesizer(_ synthesizer: AVSpeechSynthesizer, didFinish utterance: AVSpeechUtterance) {
