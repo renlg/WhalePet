@@ -2,15 +2,14 @@
   "Version": 3,
   "Meta": {
     "Duration": 1.5,
-    "Fps": 30.0,
+    "Fps": 30,
     "Loop": false,
     "AreBeziersRestricted": true,
-    "CurveCount": 16,
-    "TotalSegmentCount": 65,
-    "TotalPointCount": 81,
+    "CurveCount": 5,
+    "TotalSegmentCount": 5,
+    "TotalPointCount": 10,
     "UserDataCount": 0,
-    "TotalUserDataSize": 0,
-    "LoopDuration": 0.0
+    "TotalUserDataSize": 0
   },
   "Curves": [
     {
@@ -20,320 +19,52 @@
         0.0,
         0.0,
         0,
-        0.1,
-        3.5,
-        0,
-        0.25,
-        0.5,
-        0,
-        0.4,
-        3.8,
-        0,
-        0.55,
-        0.5,
-        0,
-        0.7,
-        3.5,
-        0,
-        0.85,
-        0.5,
-        0,
-        1.0,
-        4.0,
-        0,
-        1.2,
-        0.8,
-        0,
         1.5,
         0.0
       ]
     },
     {
       "Target": "Parameter",
-      "Id": "ParamMouthForm",
+      "Id": "ParamEyeLOpen",
       "Segments": [
         0.0,
         1.0,
         0,
-        0.5,
-        2.0,
-        0,
+        1.5,
+        1.0
+      ]
+    },
+    {
+      "Target": "Parameter",
+      "Id": "ParamEyeROpen",
+      "Segments": [
+        0.0,
         1.0,
-        1.2,
         0,
         1.5,
-        1.5
+        1.0
       ]
     },
     {
       "Target": "Parameter",
-      "Id": "ParamBodyAngleX",
+      "Id": "ParamBrowLY",
       "Segments": [
         0.0,
-        5.0,
+        1.0,
+        0,
+        1.5,
+        1.0
+      ]
+    },
+    {
+      "Target": "Parameter",
+      "Id": "ParamBrowRY",
+      "Segments": [
         0.0,
-        1.5,
-        5.0
-      ]
-    },
-    {
-      "Target": "Parameter",
-      "Id": "Param_Angle_Rotation_1_xk4",
-      "Segments": [
-        0,
-        0,
-        0,
-        0.375,
-        4,
-        0,
-        0.75,
-        0,
-        0,
-        1.125,
-        -4,
+        1.0,
         0,
         1.5,
-        0
-      ]
-    },
-    {
-      "Target": "Parameter",
-      "Id": "Param_Angle_Rotation_2_xk4",
-      "Segments": [
-        0,
-        3,
-        0,
-        0.375,
-        5,
-        0,
-        0.75,
-        -3,
-        0,
-        1.125,
-        -5,
-        0,
-        1.5,
-        3
-      ]
-    },
-    {
-      "Target": "Parameter",
-      "Id": "Param_Angle_Rotation_3_xk4",
-      "Segments": [
-        0,
-        5,
-        0,
-        0.375,
-        2,
-        0,
-        0.75,
-        -5,
-        0,
-        1.125,
-        -2,
-        0,
-        1.5,
-        5
-      ]
-    },
-    {
-      "Target": "Parameter",
-      "Id": "Param_Angle_Rotation_4_xk4",
-      "Segments": [
-        0,
-        4,
-        0,
-        0.375,
-        -2,
-        0,
-        0.75,
-        -4,
-        0,
-        1.125,
-        2,
-        0,
-        1.5,
-        4
-      ]
-    },
-    {
-      "Target": "Parameter",
-      "Id": "Param_Angle_Rotation_5_xk4",
-      "Segments": [
-        0,
-        0,
-        0,
-        0.375,
-        -5,
-        0,
-        0.75,
-        0,
-        0,
-        1.125,
-        5,
-        0,
-        1.5,
-        0
-      ]
-    },
-    {
-      "Target": "Parameter",
-      "Id": "Param_Angle_Rotation_6_xk4",
-      "Segments": [
-        0,
-        -4,
-        0,
-        0.375,
-        -2,
-        0,
-        0.75,
-        4,
-        0,
-        1.125,
-        2,
-        0,
-        1.5,
-        -4
-      ]
-    },
-    {
-      "Target": "Parameter",
-      "Id": "Param_Angle_Rotation_7_xk4",
-      "Segments": [
-        0,
-        -5,
-        0,
-        0.375,
-        3,
-        0,
-        0.75,
-        5,
-        0,
-        1.125,
-        -3,
-        0,
-        1.5,
-        -5
-      ]
-    },
-    {
-      "Target": "Parameter",
-      "Id": "maoshou2",
-      "Segments": [
-        0,
-        -0.5,
-        0,
-        0.375,
-        1,
-        0,
-        0.75,
-        -0.5,
-        0,
-        1.125,
-        -1.5,
-        0,
-        1.5,
-        -0.5
-      ]
-    },
-    {
-      "Target": "Parameter",
-      "Id": "maoshou3",
-      "Segments": [
-        0,
-        0,
-        0,
-        0.375,
-        0.8,
-        0,
-        0.75,
-        0,
-        0,
-        1.125,
-        -0.8,
-        0,
-        1.5,
-        0
-      ]
-    },
-    {
-      "Target": "Parameter",
-      "Id": "maoshou4",
-      "Segments": [
-        0,
-        1,
-        0,
-        0.375,
-        2,
-        0,
-        0.75,
-        1,
-        0,
-        1.125,
-        0,
-        0,
-        1.5,
-        1
-      ]
-    },
-    {
-      "Target": "Parameter",
-      "Id": "maoshou5",
-      "Segments": [
-        0,
-        0.3,
-        0,
-        0.375,
-        -0.5,
-        0,
-        0.75,
-        0.3,
-        0,
-        1.125,
-        1,
-        0,
-        1.5,
-        0.3
-      ]
-    },
-    {
-      "Target": "Parameter",
-      "Id": "maoshou6",
-      "Segments": [
-        0,
-        0.8,
-        0,
-        0.375,
-        1.8,
-        0,
-        0.75,
-        0.8,
-        0,
-        1.125,
-        -0.2,
-        0,
-        1.5,
-        0.8
-      ]
-    },
-    {
-      "Target": "Parameter",
-      "Id": "maoshou7",
-      "Segments": [
-        0,
-        1,
-        0,
-        0.375,
-        0,
-        0,
-        0.75,
-        1,
-        0,
-        1.125,
-        2,
-        0,
-        1.5,
-        1
+        1.0
       ]
     }
   ]

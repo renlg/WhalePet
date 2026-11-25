@@ -190,6 +190,13 @@
           "FadeInTime": 0.35,
           "FadeOutTime": 0.5
         }
+      ],
+      "tiltHead": [
+        {
+          "File": "motions/tiltHead.motion3.json",
+          "FadeInTime": 0.35,
+          "FadeOutTime": 0.5
+        }
       ]
     },
     "Expressions": [

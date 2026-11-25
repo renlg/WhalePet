@@ -82,6 +82,7 @@ html, body {
   var talkElapsed = 0
   var talkMotionElapsed = 0
   var pendingAfterTalk = null   // 说话期间排队的动作, 说完后播放
+  var requestedGroup = null     // 最近一次被请求的显式动作(可能是还没await完的)
   var currentGroup = null       // 当前正在播放的动作组 (用于 bubble/talk 互斥检查)
   // 吹泡泡嘴部参数 (cdi3 ParamGroup28「吹泡泡糖」), 与 ParamMouthOpenY 完全独立
   const BUBBLE_PARAM_IDS = ['chuipaopao', 'chuipaopao1', 'chuipaopao2', 'chuipaopao3',
@@ -159,6 +160,17 @@ html, body {
       for (let i = 0; i < BUBBLE_PARAM_IDS.length; i++) {
         try { model.internalModel.coreModel.setParameterValueById(BUBBLE_PARAM_IDS[i], 0) } catch(e) {}
       }
+      // 说话时固定"瞪大眼睛": 双眼全开(max=1) + 双眉上挑(max=1)。
+      // talk.motion3.json 本身只有这两组曲线, 但动作淡入淡出/别的动作串味
+      // 都可能把眼睛带偏, 这里每帧写死, 保证说话期间眼睛一直是瞪大的。
+      // 注意: 只碰眼睛和眉毛, 不碰嘴 —— 嘴由下面的 ParamMouthOpenY 驱动。
+      try {
+        const cmEye = model.internalModel.coreModel
+        cmEye.setParameterValueById('ParamEyeLOpen', 1)
+        cmEye.setParameterValueById('ParamEyeROpen', 1)
+        cmEye.setParameterValueById('ParamBrowLY', 1)
+        cmEye.setParameterValueById('ParamBrowRY', 1)
+      } catch(e) {}
       talkElapsed += app.ticker.deltaMS / 1000
       talkMotionElapsed += app.ticker.deltaMS / 1000
       // 兜底: Swift 侧的 didFinish/didCancel 偶发丢失会让 talking 永久卡住,
@@ -171,6 +183,11 @@ html, body {
       const mouthOpen = 0.2 + 0.8 * Math.abs(Math.sin(talkElapsed * Math.PI * 4.5))
       const cm = model.internalModel.coreModel
       cm.setParameterValueById('ParamMouthOpenY', mouthOpen)
+      // 帧内证据: getParameterValueById 在帧间读到的是 loadParameters() 还原后的值,
+      // 不能用来判断口型有没有真的在动。这里把每帧真实写入的量记下来,
+      // 由 __readParams 一起返回, 才是"说话时嘴在动"的地面真相。
+      window.__lastMouth = mouthOpen
+      window.__lastMouthAt = Date.now()
       // 诊断: 读回实际值, 判断"写了但模型不认"还是"回调没触发"
       // 默认关闭 (getParameterValueById 有成本, 且逐帧路径上不该有日志)。
       if (!window.__mouthDiagCount) window.__mouthDiagCount = 0
@@ -385,7 +402,11 @@ html, body {
     'idle', 'aidale', 'selfie', 'selfieQuick',
     'ketchup', 'openLid', 'bubble', 'splash', 'crawl', 'talk',
     'wave', 'heartKiss', 'headpat', 'tailWag', 'bellyUp', 'sleep', 'stretch', 'dance',
-    'hop', 'angryPuff', 'worship', 'coolShades', 'catPaws', 'bunnyEars', 'peek', 'coffee'
+    'hop', 'angryPuff', 'worship', 'coolShades', 'catPaws', 'bunnyEars', 'peek', 'coffee',
+    // 歪头: 新增组必须同时出现在这里、model3.json 的 Motions 和 shell.swift
+    // 的 motionAliases —— 少任何一处都会导致 __setMotion 静默拒绝 (只打
+    // "unknown motion group" 然后 return false), 表现就是"有动作指令但不动"。
+    'tiltHead'
   ])
   async function releasePendingAfterTalkFailure() {
     talking = false
@@ -415,6 +436,13 @@ html, body {
       console.error('motion model not ready:', group)
       return false
     }
+    // ⚠️ requestedGroup 必须在 talking 检查之前记录 —— 否则语音期间进来的
+    // 动作会被直接塞进 pendingAfterTalk 并 return, requestedGroup 永远是 null,
+    // 后面的 TALK_ABSORB 就不知道该保留谁。
+    if (group !== 'talk' && group !== 'idle') {
+      requestedGroup = group
+      console.log('REQ_GROUP: ' + group + ' talking=' + talking)
+    }
     // 说话锁定: 语音结束前其他动作排队，__stopTalkingMotion 会放行。
     if (talking && group !== 'talk') {
       pendingAfterTalk = group
@@ -431,6 +459,18 @@ html, body {
     try {
       const played = await model.motion(group, 0, 3)  // 3 = FORCE 优先级
       if (group === 'talk' && played === true) {
+        // ⚠️ 显式动作 (play_motion) 通常比 speak() 早几十毫秒触发,
+        // 那时 talking 还是 false 所以没进排队分支。结果 talk 用 FORCE
+        // 优先级把它盖掉, 一个 2.4s 的歪头只播了 0.05s —— 用户看到
+        // 正好是"说有动作但看不见动"。
+        // 这里在 talk 真正播放时, 把被它顶掉的显式动作转进待播队列,
+        // 说完再由 __stopTalkingMotion 放行。
+        console.log('ABSORB_DIAG: reqG=' + requestedGroup + ' curG=' + currentGroup + ' pend=' + pendingAfterTalk)
+        const absorbTarget = requestedGroup || (currentGroup && currentGroup !== 'talk' ? currentGroup : null)
+        if (absorbTarget && absorbTarget !== 'talk' && !pendingAfterTalk) {
+          pendingAfterTalk = absorbTarget
+          console.log('TALK_ABSORB: ' + absorbTarget + ' -> pendingAfterTalk')
+        }
         talking = true
         talkElapsed = 0
         talkMotionElapsed = 0
@@ -462,8 +502,19 @@ html, body {
     talkElapsed = 0
     talkMotionElapsed = 0
     model.internalModel.coreModel.setParameterValueById('ParamMouthOpenY', 0)
+    // ⚠️ talk 动作把眼睛/眉毛顶到 1 之后, 如果下一个动作(idle)没有这组曲线,
+    // Live2D 不会自动把参数复位 —— 会冻结在最后求值结果上, 表现就是"说完话
+    // 一直瞪着眼"。这里显式复位, 把脸还给 idle。
+    try {
+      const cmr = model.internalModel.coreModel
+      cmr.setParameterValueById('ParamEyeLOpen', 1)
+      cmr.setParameterValueById('ParamEyeROpen', 1)
+      cmr.setParameterValueById('ParamBrowLY', 0)
+      cmr.setParameterValueById('ParamBrowRY', 0)
+    } catch(e) {}
     const next = pendingAfterTalk || 'idle'
     pendingAfterTalk = null
+    requestedGroup = null   // 已消费, 防下次说话重复播放同一个动作
     currentGroup = null
     window.__setMotion(next)
   }
@@ -484,6 +535,21 @@ html, body {
       console.error('silent reply motion error:', e)
       await releasePendingAfterTalkFailure()
       return false
+    }
+  }
+  // 只切表情参数, 不动身体动作。
+  // 用在"模型已经明确指定 play_motion"的场合: 表情默认动作会和显式动作抢
+  // currentGroup, 最后被 speak 的 talk 覆盖, 结果是用户什么都看不见。
+  window.__setEmotionOnly = function(emotion) {
+    if (!model) return
+    const expr = EXPR_MAP[emotion] || EXPR_MAP[emotion.split('')[0]]
+    if (expr) {
+      try {
+        model.expression(expr)
+        console.log('expression(only):', emotion, '->', expr)
+      } catch(e) {
+        console.error('expression(only) error:', e)
+      }
     }
   }
   window.__setEmotion = async function(emotion) {
@@ -522,6 +588,75 @@ html, body {
 // 参数哈希逐帧变化 = 动作曲线确实在驱动骨骼（硬证据）
 
   // 调试: 播放一次动作，await 库 Promise 后把结果 console.log 出去（console 已转发到 webview.log）
+  // 歪头硬证据: 采样 ParamAngleZ 在动作播放期间的真实值。
+  // WebGL 读不了像素, 但骨架参数是唯一能证明"动作真的在跑"的量。
+  // 静止时 ParamAngleZ 恒为 0; 歪头时应该出现明显非零值。
+  // 读骨架参数当前值: __readParams("ParamEyeLOpen,ParamBrowLY") -> JSON 字符串
+  // 给 Swift 的 /debug/param 端点用, 证明动作到底有没有真的驱动骨骼。
+  window.__readParams = function(idList) {
+    try {
+      if (!model) return 'model-not-ready'
+      const cm = model.internalModel.coreModel
+      const ids = String(idList || '').split(',').map(s => s.trim()).filter(Boolean)
+      const out = {}
+      for (const id of ids) {
+        try {
+          const v = cm.getParameterValueById(id)
+          const idx = (typeof cm.getParameterIndex === 'function') ? cm.getParameterIndex(id) : null
+          // 顺便把 min/max 读出来, 免得靠猜"最大能瞪多大"
+          let mn = null, mx = null
+          try {
+            const mins = cm._parameterMinimumValues, maxs = cm._parameterMaximumValues
+            if (idx != null && idx >= 0 && mins && maxs) { mn = mins[idx]; mx = maxs[idx] }
+          } catch(e) {}
+          out[id] = { v: (typeof v === 'number' ? Number(v.toFixed(4)) : String(v)), idx: idx, min: mn, max: mx }
+        } catch(e) { out[id] = { err: String(e) } }
+      }
+      out.__diag = {
+        lastMouth: (typeof window.__lastMouth === 'number' ? Number(window.__lastMouth.toFixed(4)) : null),
+        lastMouthAgeMs: window.__lastMouthAt ? (Date.now() - window.__lastMouthAt) : null,
+        bmCount: window.__bmCount || 0,
+        talking: talking
+      }
+      return JSON.stringify(out)
+    } catch(e) { return 'err:' + String(e) }
+  }
+
+  window.__tiltProbe = function(group) {
+    (async function() {
+      try {
+        if (!model) { console.log('TILT_PROBE: model not ready'); return }
+        const cm = model.internalModel.coreModel
+        const read = () => {
+          try { return Number(cm.getParameterValueById('ParamAngleZ')) } catch(e) { return NaN }
+        }
+        const samples = []
+        const base = read()
+        samples.push({ t: 0, v: base })
+        await model.motion(group || 'tiltHead', 0, 3)
+        // 动作时长 2.4s, 每 200ms 采一次, 共采 2.6s
+        for (let i = 1; i <= 13; i++) {
+          await new Promise(r => setTimeout(r, 200))
+          samples.push({ t: i * 200, v: read() })
+        }
+        const vals = samples.map(s => s.v).filter(v => !isNaN(v))
+        const maxAbs = Math.max(...vals.map(Math.abs))
+        const minV = Math.min(...vals), maxV = Math.max(...vals)
+        console.log('TILT_PROBE: ' + JSON.stringify({
+          group: group || 'tiltHead', base: base,
+          min: Number(minV.toFixed(3)), max: Number(maxV.toFixed(3)),
+          maxAbs: Number(maxAbs.toFixed(3)),
+          moved: maxAbs > 1.0,        // >1度 才算真的歪了
+          n: vals.length,
+          samples: samples.map(s => ({ t: s.t, v: Number(s.v.toFixed(2)) }))
+        }))
+      } catch (e) {
+        console.log('TILT_PROBE: err ' + String(e))
+      }
+    })()
+    return 1
+  }
+
   window.__motionTest = function(group) {
     (async function() {
       try {

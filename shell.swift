@@ -129,7 +129,43 @@ final class LocalHTTPServer {
                 conn.send(content: Data((header + body).utf8), completion: .contentProcessed { _ in conn.cancel() })
                 return
             }
-            // 调试端点: GET /debug/bubbletest?instant=1 触发一次 instant 气泡 (验证自动隐藏)
+                        // 调试端点: GET /debug/param?ids=ParamEyeLOpen,ParamBrowLY
+            // 直接读骨架参数当前值 —— 诊断"动作到底动了没有"的地面真相。
+            // 单次 tool call 参数要短, 所以只接受 ids 列表, 不做任意 JS 执行。
+            if path.hasPrefix("/debug/param") {
+                let ids = requestURL?.queryItems?.first(where: { $0.name == "ids" })?.value ?? ""
+                let js = "window.__readParams ? window.__readParams('\(ids)') : 'no-probe'"
+                var finished = false
+                var body = "ERR: no-probe"
+                if let probe = self.jsProbe {
+                    probe(js) { r in body = r ?? "nil"; finished = true }
+                    let deadline = Date().addingTimeInterval(2.0)
+                    while !finished && Date() < deadline {
+                        RunLoop.current.run(until: Date().addingTimeInterval(0.02))
+                    }
+                }
+                let header = "HTTP/1.1 200 OK\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: \(body.utf8.count)\r\nConnection: close\r\n\r\n"
+                conn.send(content: Data((header + body).utf8), completion: .contentProcessed { _ in conn.cancel() })
+                return
+            }
+            // 调试端点: GET /debug/tiltprobe?group=tiltHead 采样 ParamAngleZ, 证明歪头真的动了
+            if path.hasPrefix("/debug/tiltprobe") {
+                let g = requestURL?.queryItems?.first(where: { $0.name == "group" })?.value ?? "tiltHead"
+                let js = "window.__tiltProbe ? window.__tiltProbe('\(g)') : 0"
+                var finished = false
+                var body = "ERR: no-probe"
+                if let probe = self.jsProbe {
+                    probe(js) { r in body = r ?? "nil"; finished = true }
+                    let deadline = Date().addingTimeInterval(3.0)
+                    while !finished && Date() < deadline {
+                        RunLoop.current.run(until: Date().addingTimeInterval(0.02))
+                    }
+                }
+                let header = "HTTP/1.1 200 OK\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: \(body.utf8.count)\r\nConnection: close\r\n\r\n"
+                conn.send(content: Data((header + body).utf8), completion: .contentProcessed { _ in conn.cancel() })
+                return
+            }
+// 调试端点: GET /debug/bubbletest?instant=1 触发一次 instant 气泡 (验证自动隐藏)
             if path.hasPrefix("/debug/bubbletest") {
                 let instant = requestURL?.queryItems?.first(where: { $0.name == "instant" })?.value == "1"
                 let js = "window.__showBubble ? (window.__showBubble('instant气泡测试', 0, \(instant ? "true" : "false")), 'ok') : 'no'"
@@ -1178,19 +1214,35 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
                    let content = msg["content"] as? String {
                     reply = content.trimmingCharacters(in: .whitespacesAndNewlines)
                 }
+                // 续写也拿不到正文时, 同样不能只吐一句写死的文案。
+                // 之前 "（小鲸鱼鼓了鼓腮帮子）" 只是文字, 不触发动作 ——
+                // 和 "歪了歪头" 是同一类 bug: 说的是动作, 做的是空气。
+                // 这里补一个真的鼓脸/卖萌动作, 让文字和表现对得上。
+                var replyMotion = motion
                 if reply.isEmpty {
-                    reply = "（小鲸鱼鼓了鼓腮帮子）"
+                    reply = "（鼓鼓腮帮子）"
+                    if replyMotion == nil {
+                        // 这里不能用外层的 motionAliases (它是 askHermes 内的局部量),
+                        // 组名就是 "angryPuff", 直接给字面量。
+                        replyMotion = "angryPuff"
+                        self.handleJSEvent("TOOL_CONTINUE: empty -> 真的播动作 angryPuff")
+                    }
                     self.handleJSEvent("TOOL_CONTINUE: empty, fallback")
                 } else {
                     self.handleJSEvent("TOOL_CONTINUE: ok chars=\(reply.count)")
                 }
                 self.isAIReplying = false
                 self.showBubble(reply)
-                self.speak(reply, emotion: emotion)
-                if let motion {
-                    let js = "window.__setMotion ? window.__setMotion('\\(self.jsEscapedString(motion))') : 0"
+                // ⚠️ 顺序关键: 显式动作必须在 speak() 之前设置。
+                // speak() 内部会 startTalkingMotion() 播 talk, talk 用 FORCE
+                // 优先级会盖掉一切后设的动作。先设动作 -> talk 播放时由
+                // 前端 TALK_ABSORB 把它转进 pendingAfterTalk -> 说完后放行。
+                if let m = replyMotion {
+                    self.handleJSEvent("SET_MOTION(pre-talk): \(m)")
+                    let js = "window.__setMotion ? window.__setMotion('\(self.jsEscapedString(m))') : 0"
                     self.webView.evaluateJavaScript(js, completionHandler: nil)
                 }
+                self.speak(reply, emotion: emotion)
                 if let moveTarget {
                     self.moveWindow(xPercent: moveTarget.0, yPercent: moveTarget.1,
                                     reason: "ai", duration: 1.2)
@@ -1277,7 +1329,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
 
         【可用的工具】
         - set_emotion(emotion): 情绪表情，可选值：开心、悲伤、生气、害羞、惊讶、疑惑、疲惫、调皮、无语、心动、星星眼、爱心眼、晕、哭、发呆、恶魔角、天使、猫耳爱心、兔兔星星、耍帅、花花爱心、心跳脸红、虚脱流汗、晕眩、兴奋眨眼、舔嘴、阴郁（每次回复必须调用一次，选最贴切的）
-        - play_motion(motion): 身体动作，可选值：待机、撒娇、自拍、简单自拍、番茄酱、开盖、吹泡泡、喷水、爬动、招手、比心、摸头、摇尾巴、露肚皮、睡觉、伸懒腰、跳舞、蹦跳、生气鼓脸、崇拜、墨镜、猫爪、兔耳、探头、喝咖啡（只在需要明显身体动作时调用）
+        - play_motion(motion): 身体动作，可选值：待机、撒娇、自拍、简单自拍、番茄酱、开盖、吹泡泡、喷水、爬动、招手、比心、摸头、摇尾巴、露肚皮、睡觉、伸懒腰、跳舞、蹦跳、生气鼓脸、崇拜、墨镜、猫爪、兔耳、探头、喝咖啡、歪头（只在需要明显身体动作时调用）
+            注意：想表达"歪头/歪脑袋/卖萌"时必须用"歪头"，不要用"探头"顶替——探头是探头，歪头是歪头。
         - move_window(x, y): 移动窗口，x/y 为 0-100 百分比（需要走动/找我时调用；“找我”可用 direction 参数，移动到用户常驻位置，例如右下角或屏幕中央附近）
         - open_chat(): 弹出文本输入框让主人打字对话（主人要求打字/打开输入框时调用）
         - open_settings(): 打开设置面板（主人要改配置/API/大小/音色/开关时调用）
@@ -1302,7 +1355,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
                             "motion": [
                                 "type": "string",
                                 "description": "要播放的身体动作",
-                                "enum": ["待机", "撒娇", "自拍", "简单自拍", "番茄酱", "开盖", "吹泡泡", "喷水", "爬动", "招手", "比心", "摸头", "摇尾巴", "露肚皮", "睡觉", "伸懒腰", "跳舞", "蹦跳", "生气鼓脸", "崇拜", "墨镜", "猫爪", "兔耳", "探头", "喝咖啡"]
+                                "enum": ["待机", "撒娇", "自拍", "简单自拍", "番茄酱", "开盖", "吹泡泡", "喷水", "爬动", "招手", "比心", "摸头", "摇尾巴", "露肚皮", "睡觉", "伸懒腰", "跳舞", "蹦跳", "生气鼓脸", "崇拜", "墨镜", "猫爪", "兔耳", "探头", "喝咖啡", "歪头"]
                             ]
                         ],
                         "required": ["motion"],
@@ -1484,6 +1537,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
                     , "bunnyears": "bunnyEars", "兔耳": "bunnyEars"
                     , "peek": "peek", "探头": "peek"
                     , "coffee": "coffee", "喝咖啡": "coffee"
+                    // 歪头: 之前模型想说"歪头"却没有对应动作, 只好拿"探头"顶替,
+                    // 或者干脆只吐一句"（小鲸鱼歪了歪头）"的文案 —— 说的是动作,
+                    // 做的是空气。现在有真正用 ParamAngleZ 实现的歪头动作。
+                    , "tilthead": "tiltHead", "歪头": "tiltHead", "歪歪头": "tiltHead"
+                    , "歪脑袋": "tiltHead", "歪了歪头": "tiltHead", "卖萌": "tiltHead"
                 ]
                 let validEmotions: Set<String> = ["开心", "悲伤", "生气", "害羞", "惊讶", "疑惑", "疲惫", "调皮", "无语", "心动", "星星眼", "爱心眼", "晕", "哭", "发呆", "恶魔角", "天使", "猫耳爱心", "兔兔星星", "耍帅", "花花爱心", "心跳脸红", "虚脱流汗", "晕眩", "兴奋眨眼", "舔嘴", "阴郁"]
                 let toolCalls = msg["tool_calls"] as? [[String: Any]] ?? []
@@ -1498,48 +1556,48 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
                     self.markActivity()
                     guard let argumentData = arguments.data(using: .utf8),
                           let args = try? JSONSerialization.jsonObject(with: argumentData) as? [String: Any] else {
-                        print("TOOL_RESULT: \(name) invalid JSON arguments")
+                        self.handleJSEvent("TOOL_RESULT: \(name) invalid JSON arguments")
                         continue
                     }
                     switch name {
                     case "set_emotion":
                         if let value = args["emotion"] as? String, validEmotions.contains(value) {
                             emotion = value
-                            print("TOOL_RESULT: set_emotion accepted \(value)")
+                            self.handleJSEvent("TOOL_RESULT: set_emotion accepted \(value)")
                         } else {
-                            print("TOOL_RESULT: set_emotion rejected \(args)")
+                            self.handleJSEvent("TOOL_RESULT: set_emotion rejected \(args)")
                         }
                     case "play_motion":
                         if let value = args["motion"] as? String,
                            let group = motionAliases[value.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()] {
                             motion = group
-                            print("TOOL_RESULT: play_motion accepted \(value) -> \(group)")
+                            self.handleJSEvent("TOOL_RESULT: play_motion accepted \(value) -> \(group)")
                         } else {
-                            print("TOOL_RESULT: play_motion rejected \(args)")
+                            self.handleJSEvent("TOOL_RESULT: play_motion rejected \(args)")
                         }
                     case "move_window":
                         if let target = self.moveTarget(from: args) {
                             moveTarget = target
-                            print("TOOL_RESULT: move_window accepted \(target.0)% \(target.1)%")
+                            self.handleJSEvent("TOOL_RESULT: move_window accepted \(target.0)% \(target.1)%")
                         } else {
-                            print("TOOL_RESULT: move_window rejected \(args)")
+                            self.handleJSEvent("TOOL_RESULT: move_window rejected \(args)")
                         }
                     case "open_chat":
-                        print("TOOL_RESULT: open_chat called")
+                        self.handleJSEvent("TOOL_RESULT: open_chat called")
                         self.startChat(playGreeting: false)
                     case "open_settings":
-                        print("TOOL_RESULT: open_settings called")
+                        self.handleJSEvent("TOOL_RESULT: open_settings called")
                         self.openSettings()
                     case "set_scale":
                         if let scale = args["scale"] as? Int, (1...5).contains(scale) {
-                            print("TOOL_RESULT: set_scale accepted \(scale)")
+                            self.handleJSEvent("TOOL_RESULT: set_scale accepted \(scale)")
                             self.applyScale(scale)
                             self.showBubble("✅ 已调整为 x\(scale) 大小")
                         } else {
-                            print("TOOL_RESULT: set_scale rejected \(args)")
+                            self.handleJSEvent("TOOL_RESULT: set_scale rejected \(args)")
                         }
                     default:
-                        print("TOOL_RESULT: unsupported tool \(name)")
+                        self.handleJSEvent("TOOL_RESULT: unsupported tool \(name)")
                     }
                 }
 
@@ -1611,15 +1669,31 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
                     )
                     return
                 }
-                if text.isEmpty { text = "（小鲸鱼歪了歪头）" }
+                // 兜底: 模型既没正文也没 tool_calls (罕见 —— 通常是上游把
+                // tool_calls 吞了, 或模型只吐了空 content)。
+                // 这里绝对不能写死一句"（小鲸鱼歪了歪头）"就完事: 那句话
+                // 只是文字, 不会触发任何动作, 用户看到"歪了歪头"却不动 ——
+                // 这正是"有文字没动作"的来源。正确做法是: 真的播一个动作,
+                // 并给一句与之匹配的短文本。
+                if text.isEmpty {
+                    // 用真正的 tiltHead (ParamAngleZ 歪头), 不是写死文案
+                    if let g = motionAliases["歪头"] {
+                        motion = g
+                        self.handleJSEvent("TEXT_FALLBACK: 空回复 -> 真的播歪头动作 \(g)")
+                    }
+                    text = "（歪头卖个萌）"
+                }
                 // 触发情绪表情
+                // ⚠️ 只设表情参数, 不带默认身体动作: 默认动作会先抢占 currentGroup,
+                // 紧接着下面显式 motion 覆盖它, 再被 speak 的 talk 覆盖 —— 三层抢占
+                // 下来用户什么动作都看不清。显式动作由下面的 __setMotion 负责。
                 if let emotion {
-                    let js = "window.__setEmotion ? window.__setEmotion('\(self.jsEscapedString(emotion))') : 0"
+                    let js = "window.__setEmotionOnly ? window.__setEmotionOnly('\(self.jsEscapedString(emotion))') : (window.__setEmotion ? window.__setEmotion('\(self.jsEscapedString(emotion))') : 0)"
                     self.webView.evaluateJavaScript(js, completionHandler: nil)
                 }
                 // 显式动作在情绪默认动作之后触发，以 FORCE 优先级覆盖它。
                 if let motion {
-                    print("SET_MOTION: \(motion)")
+                    self.handleJSEvent("SET_MOTION: \(motion)")
                     let js = "window.__setMotion ? window.__setMotion('\(self.jsEscapedString(motion))') : 0"
                     self.webView.evaluateJavaScript(js, completionHandler: nil)
                 }
