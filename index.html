@@ -251,9 +251,32 @@ html, body {
     }, tailMs)
   }
 
-  window.__showBubble = function(text, durationMs, instant) {
+  // 最后一道防线: 清洗模型泄漏的内部工具调用标记。
+  // 背景: DeepSeek 系模型走中转站时, 会把内部标签直接写进 content, 形如
+  // `<｜｜DSML｜｜ calls>` + 换行 + `<｜｜`。注意竖线是全角 U+FF5C。
+  // Swift 侧 showBubble 已经清洗一次, 但 typeJs 等路径是直接拼 JS 调进来的,
+  // 所以这里必须再兜一层 —— 否则气泡里会显示成一堆天书。
+  const DSML_FULL = '\uFF5C'
+  window.__sanitizeBubble = function(text) {
+    if (!text) return ''
+    let s = String(text)
+    // ① 从标记开头到行尾全部吃掉 (含只有开头没有闭合的情况)
+    s = s.replace(new RegExp('<' + '[' + DSML_FULL + '|][^' + '\\n' + ']*$', 'gm'), '')
+    // ② 行首孤立标记片段
+    s = s.replace(new RegExp('\\n?[\\s]*<' + '[' + DSML_FULL + '|]{1,}[^<>\\n]{0,40}(\\n|$)'), '')
+    // ③ 半角内联控制标记 <|endoftext|> 等
+    s = s.replace(/<\|[^<>\n]{0,40}\|>/g, '')
+    s = s.trim()
+    // 只剩标点/空白 -> 视为空, 交给上层丢弃
+    if (!Array.from(s).some(ch => /[\p{L}\p{N}]/u.test(ch))) return ''
+    return s
+  }
+
+  window.__showBubble = function(rawText, durationMs, instant) {
     const b = document.getElementById('bubble')
     if (!b) return
+    const text = window.__sanitizeBubble(rawText)
+    if (!text) { b.style.display = 'none'; return }
     b.style.display = 'block'
     clearTimeout(window.__bubbleTimer)
     clearInterval(window.__typeTimer)

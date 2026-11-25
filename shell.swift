@@ -129,7 +129,17 @@ final class LocalHTTPServer {
                 conn.send(content: Data((header + body).utf8), completion: .contentProcessed { _ in conn.cancel() })
                 return
             }
-                        // 调试端点: GET /debug/param?ids=ParamEyeLOpen,ParamBrowLY
+                        // 调试端点: GET /debug/sanitize?text=... 直接测气泡清洗函数
+            // 用于验证 showBubble 的过滤逻辑(不依赖 TTS, 秒回)
+            if path.hasPrefix("/debug/sanitize") {
+                let raw = requestURL?.queryItems?.first(where: { $0.name == "text" })?.value ?? ""
+                let out = AppDelegate.sanitizedBubbleText(raw)
+                let body = "RAW:" + String(raw.count) + " OUT:" + String(out.count) + " TEXT=" + out
+                let header = "HTTP/1.1 200 OK\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: \(body.utf8.count)\r\nConnection: close\r\n\r\n"
+                conn.send(content: Data((header + body).utf8), completion: .contentProcessed { _ in conn.cancel() })
+                return
+            }
+            // 调试端点: GET /debug/param?ids=ParamEyeLOpen,ParamBrowLY
             // 直接读骨架参数当前值 —— 诊断"动作到底动了没有"的地面真相。
             // 单次 tool call 参数要短, 所以只接受 ids 列表, 不做任意 JS 执行。
             if path.hasPrefix("/debug/param") {
@@ -2121,9 +2131,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
                 // 字音同步: 语音开始的同时启动打字机, 文字按音频时长均匀打出
                 let typeJs: String
                 if durationMs > 0 {
-                    typeJs = "window.__showBubble ? window.__showBubble('\(self.jsEscapedString(text))', \(Int(durationMs))) : 0"
+                    typeJs = "window.__showBubble ? window.__showBubble('\(self.jsEscapedString(AppDelegate.sanitizedBubbleText(text)))', \(Int(durationMs))) : 0"
                 } else {
-                    typeJs = "window.__showBubble ? window.__showBubble('\(self.jsEscapedString(text))', 0) : 0"
+                    typeJs = "window.__showBubble ? window.__showBubble('\(self.jsEscapedString(AppDelegate.sanitizedBubbleText(text)))', 0) : 0"
                 }
                 self.webView.evaluateJavaScript(typeJs, completionHandler: nil)
                 self.handleJSEvent("SPEAK_CLOUD: ready=\(Int(Date().timeIntervalSince(ttsStartedAt) * 1000))ms backend=\(self.ttsBackend(for: voice)) voice=\(voice) emotion=\(emotion ?? "default") rate=\(params.rate) pitchST=\(self.volcPitchSemitones()) volume=\(params.volume) chars=\(speechText.count) dur=\(Int(durationMs))ms")
@@ -2423,9 +2433,48 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
         return out
     }
 
+    // 清洗模型泄漏的内部工具调用标记。
+    //
+    // 背景: DeepSeek 系模型(经中转站)有时把内部的工具调用标签直接写进 content
+    // 字段, 形如 `<｜｜DSML｜｜ calls>\n<｜｜invoke name="..."｜｜>...`。注意那两个
+    // 竖线是全角 U+FF5C, 不是 ASCII '|', 所以普通的 stripTags 正则抓不到。
+    // 这些标记一旦进气泡就显示成乱码/天书。这里在唯一的出口(sanitizedBubbleText)
+    // 统一拦截, 保证任何路径的文字都干净。
+    static func sanitizedBubbleText(_ raw: String) -> String {
+        var s = raw
+        // ① 从标记开头到行尾全部吃掉 —— 只有开头没有闭合的情况(最常见)。
+        //    `<｜｜DSML｜｜ calls>` + 换行 + `<｜｜` 这种尾部被截断的也要清干净。
+        if let re = try? NSRegularExpression(pattern: "<[｜|][^\\n]*$", options: [.anchorsMatchLines]) {
+            s = re.stringByReplacingMatches(in: s, options: [],
+                                            range: NSRange(s.startIndex..., in: s), withTemplate: "")
+        }
+        // ② 行首的孤立标记片段(前面可能带换行/空白)
+        if let re = try? NSRegularExpression(pattern: "\\n?[\\s]*<[｜|]{1,}[^<>\\n]{0,40}(\\n|$)", options: []) {
+            s = re.stringByReplacingMatches(in: s, options: [],
+                                            range: NSRange(s.startIndex..., in: s), withTemplate: "")
+        }
+        // ③ 常见内联控制标记: <|endoftext|> <|im_start|> 等(半角竖线)
+        if let re = try? NSRegularExpression(pattern: "<[|][^<>\\n]{0,40}[|]>", options: []) {
+            s = re.stringByReplacingMatches(in: s, options: [],
+                                            range: NSRange(s.startIndex..., in: s), withTemplate: "")
+        }
+        s = s.trimmingCharacters(in: .whitespacesAndNewlines)
+        // ④ 清洗后如果只剩标点/空, 视为空 —— 交给上层走 fallback, 别显示一坨符号
+        let meaningful = s.unicodeScalars.filter { !CharacterSet.punctuationCharacters.contains($0)
+            && !CharacterSet.whitespacesAndNewlines.contains($0) }
+        if meaningful.isEmpty { return "" }
+        return s
+    }
+
     // 页面里显示气泡
-    func showBubble(_ text: String, durationMs: Int = 0, instant: Bool = false) {
-        let js = "window.__showBubble ? window.__showBubble('\(jsEscapedString(text))', \(durationMs), \(instant ? "true" : "false")) : 0"
+    func showBubble(_ rawText: String, durationMs: Int = 0, instant: Bool = false) {
+        let text = Self.sanitizedBubbleText(rawText)
+        guard !text.isEmpty else {
+            handleJSEvent("BUBBLE_SANITIZED_EMPTY: 原始文本全是模型标记/标点, 已丢弃")
+            return
+        }
+        if text != rawText { handleJSEvent("BUBBLE_SANITIZED: \(rawText.count)->\(text.count) chars") }
+        let js = "window.__showBubble ? window.__showBubble('\(jsEscapedString(text))', \(durationMs), \(instant ? true : false)) : 0"
         webView.evaluateJavaScript(js, completionHandler: nil)
     }
 
