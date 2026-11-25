@@ -40,6 +40,9 @@ cat > "$APP/Contents/Info.plist" <<'PLISTEOF'
   <key>CFBundleShortVersionString</key><string>1.0</string>
   <key>LSUIElement</key><true/>
   <key>NSHighResolutionCapable</key><true/>
+  <!-- 语音对话要用麦克风。缺这条 macOS 26 会直接 TCC 强杀进程
+       (__TCC_CRASHING_DUE_TO_PRIVACY_VIOLATION__, SIGABRT) -->
+  <key>NSMicrophoneUsageDescription</key><string>WhalePet 需要麦克风用于语音对话</string>
 </dict>
 </plist>
 PLISTEOF

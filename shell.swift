@@ -430,6 +430,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
     }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        // 单实例: 用户重复点图标时, 只保留最先启动的那只宠物。
+        // 用 CFBundleIdentifier + pid 判据, 直接把新实例踢掉 (退出码 0),
+        // 并顺手把已有实例的窗口提到前面, 让用户感觉"就是它被唤醒了"。
+        let myPID = ProcessInfo.processInfo.processIdentifier
+        if let bid = Bundle.main.bundleIdentifier {
+            let running = NSRunningApplication.runningApplications(withBundleIdentifier: bid)
+            if running.count > 1 {
+                let others = running.filter { $0.processIdentifier != myPID }
+                if let first = others.first {
+                    NSLog("[WhalePet] 已有实例在运行 (pid=\(first.processIdentifier)), 本实例退出")
+                    first.activate(options: [.activateIgnoringOtherApps])
+                    NSApp.terminate(nil)
+                    exit(0)
+                }
+            }
+        }
         // 调试端点 GET /debug/ask?text=... 走完整 askHermes 链路（验证会话续接/超时）
         NotificationCenter.default.addObserver(
             forName: .init("WhalePetDebugAsk"), object: nil, queue: .main
