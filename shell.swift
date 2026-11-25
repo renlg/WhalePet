@@ -1026,6 +1026,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
             baseURL = "http://127.0.0.1:8642/v1"
             apiKey = key
             if model.isEmpty { model = "hermes-token" }
+        } else if apiKey.isEmpty {
+            // 外部中转站必须带 Bearer, 否则上游一律返回
+            // 500 {"message":"Internal server error, please try again later"} (99 字节)。
+            // 别让用户手填: 先复用同名 key 的既有配置, 再退回内置网关。
+            if let reuse = readReusableKey(for: baseURL) {
+                apiKey = reuse
+                handleJSEvent("API_KEY_REUSE: 复用 ~/.hermes/.env 的 key 访问 \(baseURL)")
+            } else if let gw = readGatewayKey(), baseURL.contains("127.0.0.1") || baseURL.contains("localhost") {
+                apiKey = gw
+                handleJSEvent("API_KEY_REUSE: 复用 API_SERVER_KEY 访问本机 \(baseURL)")
+            } else {
+                isAIReplying = false
+                showBubble("⚠️ 缺少 API Key: 请到设置里填写 \(baseURL) 的 key")
+                handleJSEvent("API_KEY_MISSING: \(baseURL)")
+                return
+            }
         }
         // 规范化 baseURL: 去掉末尾 /
         if baseURL.hasSuffix("/") { baseURL = String(baseURL.dropLast()) }
@@ -1176,7 +1192,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
                 guard let self else { return }
                 self.isAIReplying = false
                 self.markActivity()
-                self.handleJSEvent("HERMES_RESPONSE: \(Int(Date().timeIntervalSince(requestStartedAt) * 1000))ms bytes=\(data?.count ?? 0)")
+                self.handleJSEvent("HERMES_RESPONSE: \(Int(Date().timeIntervalSince(requestStartedAt) * 1000))ms bytes=\(data?.count ?? 0) status=\((resp as? HTTPURLResponse)?.statusCode ?? -1)")
                 if let err {
                     self.showBubble("⚠️ 网络错误: \(err.localizedDescription)")
                     return
@@ -1184,7 +1200,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
                 guard let http = resp as? HTTPURLResponse,
                       (200..<300).contains(http.statusCode) else {
                     let status = (resp as? HTTPURLResponse)?.statusCode ?? -1
-                    self.showBubble("⚠️ API HTTP 错误: \(status)")
+                    // 把上游真实原因带回气泡里: 中转站 500/502 的 body 里有可读 message,
+                    // 只显示 "HTTP 错误: 500" 对排查毫无帮助。
+                    let raw = data.map { String(data: $0, encoding: .utf8) ?? "" } ?? ""
+                    var detail = ""
+                    if let d = raw.data(using: .utf8),
+                       let obj = try? JSONSerialization.jsonObject(with: d) as? [String: Any],
+                       let err = obj["error"] as? [String: Any],
+                       let msg = err["message"] as? String {
+                        detail = msg
+                    } else if !raw.isEmpty {
+                        detail = String(raw.prefix(120))
+                    }
+                    self.handleJSEvent("HERMES_HTTP_ERR: status=\(status) body=\(raw.prefix(300))")
+                    self.showBubble("⚠️ API HTTP \(status)\(detail.isEmpty ? "" : ": " + detail)")
                     return
                 }
                 guard let data, let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
@@ -1948,6 +1977,77 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
             }
         }
         return nil
+    }
+
+    /// 给外部 baseURL 找一个能用的 key, 避免用户手动复制粘贴。
+    /// 权威来源是 ~/.hermes/config.yaml: 里面每个 provider 都写了 base_url + key_env,
+    /// 按主机名匹配最可靠; 匹配不到再退回 .env 的 OPENAI_API_KEY。
+    func readReusableKey(for baseURL: String) -> String? {
+        guard let host = URL(string: baseURL)?.host?.lowercased(), !host.isEmpty else { return nil }
+
+        // 1) config.yaml: base_url 主机名 == host → 取该条目的 key_env (或 api_key)
+        if let yaml = try? String(contentsOfFile: "\(NSHomeDirectory())/.hermes/config.yaml", encoding: .utf8) {
+            let lines = yaml.components(separatedBy: "\n")
+            for (i, line) in lines.enumerated() {
+                let t = line.trimmingCharacters(in: .whitespaces)
+                guard t.hasPrefix("base_url:") else { continue }
+                let raw = t.dropFirst("base_url:".count).trimmingCharacters(in: .whitespaces)
+                let url = raw.trimmingCharacters(in: CharacterSet(charactersIn: "\"'"))
+                guard let h = URL(string: url)?.host?.lowercased(), h == host else { continue }
+                // 同一 provider 块内往后找 key_env / api_key
+                for j in (i + 1)..<min(i + 8, lines.count) {
+                    let n = lines[j].trimmingCharacters(in: .whitespaces)
+                    if n.hasPrefix("base_url:") || n.hasPrefix("- ") { break }
+                    if n.hasPrefix("key_env:") {
+                        let name = n.dropFirst("key_env:".count).trimmingCharacters(in: .whitespaces)
+                            .trimmingCharacters(in: CharacterSet(charactersIn: "\"'"))
+                        if let k = envValue(named: name), !k.isEmpty { return k }
+                    }
+                    if n.hasPrefix("api_key:") {
+                        let v = n.dropFirst("api_key:".count).trimmingCharacters(in: .whitespaces)
+                            .trimmingCharacters(in: CharacterSet(charactersIn: "\"'"))
+                        if !v.isEmpty { return v }
+                    }
+                }
+            }
+        }
+
+        // 2) .env: 配对的 XXX_BASE_URL 主机名相同 → XXX_API_KEY
+        let env = readDotEnv()
+        for (k, v) in env where k.hasSuffix("_BASE_URL") {
+            guard let h = URL(string: v)?.host?.lowercased(), h == host else { continue }
+            if let key = env[k.replacingOccurrences(of: "_BASE_URL", with: "_API_KEY")], !key.isEmpty {
+                return key
+            }
+        }
+        // 3) 兜底: 只有本机回环地址才复用通用 key, 防止把 key 发给陌生域名
+        let isLocal = host == "127.0.0.1" || host == "localhost" || host == "0.0.0.0"
+        if isLocal, let key = env["OPENAI_API_KEY"], !key.isEmpty { return key }
+        return nil
+    }
+
+    /// 按变量名从 ~/.hermes/.env 取单个值 (config.yaml 的 key_env 指向它)
+    func envValue(named name: String) -> String? {
+        return readDotEnv()[name]
+    }
+
+    /// 读 ~/.hermes/.env 成字典 (忽略注释与空值, 去掉成对引号)
+    func readDotEnv() -> [String: String] {
+        var out: [String: String] = [:]
+        guard let content = try? String(contentsOfFile: "\(NSHomeDirectory())/.hermes/.env", encoding: .utf8) else {
+            return out
+        }
+        for line in content.components(separatedBy: "\n") {
+            let t = line.trimmingCharacters(in: .whitespaces)
+            guard !t.hasPrefix("#"), let eq = t.firstIndex(of: "=") else { continue }
+            let k = String(t[t.startIndex..<eq]).trimmingCharacters(in: .whitespaces)
+            var v = String(t[t.index(after: eq)...]).trimmingCharacters(in: .whitespaces)
+            if v.count >= 2, (v.hasPrefix("\"") && v.hasSuffix("\"")) || (v.hasPrefix("'") && v.hasSuffix("'")) {
+                v = String(v.dropFirst().dropLast())
+            }
+            if !k.isEmpty, !v.isEmpty { out[k] = v }
+        }
+        return out
     }
 
     // 安全的 JS 字符串字面量编码 (处理换行/反斜杠/引号/Unicode 行分隔符)
