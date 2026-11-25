@@ -22,6 +22,10 @@ final class LocalHTTPServer {
     private let root: String
     private let port: UInt16
     private let debugToken = UUID().uuidString.replacingOccurrences(of: "-", with: "").lowercased()
+    /// 气泡状态探针 (调试用), 由 AppDelegate 注入以避免在此处引用 webView
+    var bubbleStateProbe: ((@escaping (String?) -> Void) -> Void)?
+    /// 通用 JS 求值探针 (调试用), 同上
+    var jsProbe: ((String, @escaping (String?) -> Void) -> Void)?
 
     init(root: String, port: UInt16) {
         self.root = root
@@ -78,6 +82,43 @@ final class LocalHTTPServer {
                requestURL?.queryItems?.first(where: { $0.name == "token" })?.value != debugToken {
                 let body = "403 Forbidden"
                 let header = "HTTP/1.1 403 Forbidden\r\nContent-Type: text/plain\r\nContent-Length: \(body.utf8.count)\r\nConnection: close\r\n\r\n"
+                conn.send(content: Data((header + body).utf8), completion: .contentProcessed { _ in conn.cancel() })
+                return
+            }
+            // 调试端点: GET /debug/bubbletest?instant=1 触发一次 instant 气泡 (验证自动隐藏)
+            if path.hasPrefix("/debug/bubbletest") {
+                let instant = requestURL?.queryItems?.first(where: { $0.name == "instant" })?.value == "1"
+                let js = "window.__showBubble ? (window.__showBubble('instant气泡测试', 0, \(instant ? "true" : "false")), 'ok') : 'no'"
+                var finished = false
+                var body = "ERR: no-probe"
+                if let probe = self.jsProbe {
+                    probe(js) { r in body = r ?? "nil"; finished = true }
+                    let deadline = Date().addingTimeInterval(1.5)
+                    while !finished && Date() < deadline {
+                        RunLoop.current.run(mode: .default, before: Date().addingTimeInterval(0.02))
+                    }
+                }
+                let header = "HTTP/1.1 200 OK\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: \(body.utf8.count)\r\nConnection: close\r\n\r\n"
+                conn.send(content: Data((header + body).utf8), completion: .contentProcessed { _ in conn.cancel() })
+                return
+            }
+            // 调试端点: GET /debug/bubble 返回气泡当前状态 (验证自动隐藏是否生效)
+            // 用注入的闭包拿状态: 这个 handler 在没有 AppDelegate 引用的队列上跑,
+            // 直接访问 webView 会编译失败 (cannot find 'webView' in scope)。
+            if path.hasPrefix("/debug/bubble") {
+                var body = "ERR: no-probe"
+                if let probe = self.bubbleStateProbe {
+                    var finished = false
+                    probe { json in
+                        if let j = json { body = j }
+                        finished = true
+                    }
+                    let deadline = Date().addingTimeInterval(1.5)
+                    while !finished && Date() < deadline {
+                        RunLoop.current.run(mode: .default, before: Date().addingTimeInterval(0.02))
+                    }
+                }
+                let header = "HTTP/1.1 200 OK\r\nContent-Type: application/json; charset=utf-8\r\nContent-Length: \(body.utf8.count)\r\nConnection: close\r\n\r\n"
                 conn.send(content: Data((header + body).utf8), completion: .contentProcessed { _ in conn.cancel() })
                 return
             }
@@ -480,6 +521,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
         }
         // 启动内置 HTTP server (提供本地 Live2D 页面)
         httpServer = LocalHTTPServer(root: RESOURCE_DIR, port: SERVER_PORT)
+        // 气泡状态探针 (调试端点 /debug/bubble 用)
+        httpServer?.bubbleStateProbe = { [weak self] done in
+            guard let self else { done(nil); return }
+            let js = "JSON.stringify({d:(document.getElementById('bubble')||{style:{}}).style.display||'none',t:((document.getElementById('bubble')||{}).textContent||'').slice(0,20)})"
+            self.webView.evaluateJavaScript(js) { result, err in
+                done(result as? String)
+            }
+        }
+        // 通用 JS 探针 (调试端点 /debug/bubbletest 用)
+        httpServer?.jsProbe = { [weak self] js, done in
+            guard let self else { done(nil); return }
+            self.webView.evaluateJavaScript(js) { result, _ in
+                done(result as? String)
+            }
+        }
         _ = httpServer?.start()
         // 恢复保存的设置
         let savedScale = UserDefaults.standard.integer(forKey: "pet_scale")
@@ -1010,6 +1066,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
         recognitionRequest = nil
         resetVoiceChatUtterance()
         inputBar?.setListening(false)
+        // 真正停止监听 (logStopped=true 表示用户主动停) 时立刻收起气泡,
+        // 别让 "🎧 在听呢..." / "你说: ..." 一直挂在屏幕上。
+        // 中间态的 restart (logStopped=false) 不动气泡, 否则说话过程中气泡会闪。
+        if logStopped {
+            webView.evaluateJavaScript("window.__hideBubble ? window.__hideBubble() : 0", completionHandler: nil)
+        }
         if logStopped { handleJSEvent("VOICECHAT: stopped") }
     }
 
@@ -1288,7 +1350,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
             "max_tokens": 120
         ]
         req.httpBody = try? JSONSerialization.data(withJSONObject: body)
-        showBubble("🐳 让我想想...")
+        // "让我想想..." 只是等待提示, 不要长时间挂着: 给个短时长,
+        // 真回复来了会用新气泡覆盖它。
+        showBubble("🐳 让我想想...", durationMs: 1200)
         URLSession.shared.dataTask(with: req) { [weak self] data, resp, err in
             DispatchQueue.main.async {
                 guard let self else { return }

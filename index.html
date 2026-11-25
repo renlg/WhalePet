@@ -221,6 +221,19 @@ html, body {
   // 气泡显示 (Swift 壳调用) — 打字机逐字效果
   // durationMs > 0: 文字按音频时长均匀打出 (字音同步); 0: 固定 40ms/字
   // instant=true: 整段直接显示, 不重打 (语音识别实时更新用, 避免闪烁)
+  // 气泡自动隐藏: 打字完成后只留一小段尾巴, 不再固定 8s。
+  // instant 路径原来直接 return, 压根没设计时器 —— 语音对话里
+  // showBubble("你说: ...", instant:true) 每识别到字就调一次,
+  // 结果气泡永久停在屏幕上, 这就是"一直显示"的直接原因。
+  const BUBBLE_TAIL_MS = 3000
+  function scheduleBubbleHide(b, tailMs) {
+    clearTimeout(window.__bubbleTimer)
+    window.__bubbleTimer = setTimeout(() => {
+      // 只有在这段时间内没有新气泡才隐藏, 避免把更新的内容盖掉
+      b.style.display = 'none'
+    }, tailMs)
+  }
+
   window.__showBubble = function(text, durationMs, instant) {
     const b = document.getElementById('bubble')
     if (!b) return
@@ -230,10 +243,15 @@ html, body {
     b.textContent = ''
     if (instant) {
       b.textContent = text
+      // ⚠️ 这里必须设隐藏计时, 否则气泡永不消失
+      window.__bubbleTimer = setTimeout(() => { b.style.display = 'none' }, BUBBLE_TAIL_MS)
       return
     }
     const chars = Array.from(text)
-    if (chars.length === 0) return
+    if (chars.length === 0) {
+      window.__bubbleTimer = setTimeout(() => { b.style.display = 'none' }, BUBBLE_TAIL_MS)
+      return
+    }
     let i = 0
     let intervalMs = 40
     if (durationMs && durationMs > 0) {
@@ -249,9 +267,17 @@ html, body {
       }
       if (i >= chars.length) {
         clearInterval(window.__typeTimer)
-        window.__bubbleTimer = setTimeout(() => { b.style.display = 'none' }, 8000)
+        scheduleBubbleHide(b, BUBBLE_TAIL_MS)
       }
     }, intervalMs)
+  }
+
+  // 立刻收起气泡 (停止监听/打断播报时用), 不等尾巴
+  window.__hideBubble = function() {
+    clearTimeout(window.__bubbleTimer)
+    clearInterval(window.__typeTimer)
+    const b = document.getElementById('bubble')
+    if (b) b.style.display = 'none'
   }
 
   // 尺寸调整: innerWidth/innerHeight 是唯一真值，避免 Swift 调用与 WebView layout 竞态。
