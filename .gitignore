@@ -21,3 +21,6 @@ webview.log
 .env
 *.pem
 *.key
+
+# 动作文件编辑前的本地备份, 不进仓库
+model/motions/*.orig
