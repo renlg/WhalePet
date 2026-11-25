@@ -1007,9 +1007,71 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
         isInputOpen = false
     }
 
+    /// 工具调用之后拿正文。
+    /// OpenAI 协议里 finish_reason=tool_calls 时 content 通常为空, 正文要靠
+    /// 回填 tool 结果后再请求一次才出来。桌宠的工具是即时副作用 (动作/表情已播),
+    /// 所以这里只需要续写的正文文本。
+    func continueAfterToolCalls(fullPrompt: String, userText: String,
+                                assistantMsg: [String: Any], toolCalls: [[String: Any]],
+                                baseURL: String, apiKey: String, model: String,
+                                emotion: String?, motion: String?, moveTarget: (Int, Int)?) {
+        guard let url = URL(string: baseURL + "/chat/completions") else { return }
+        var messages: [[String: Any]] = [
+            ["role": "system", "content": fullPrompt],
+            ["role": "user", "content": userText],
+            ["role": "assistant", "content": assistantMsg["content"] as? String ?? "",
+             "tool_calls": toolCalls]
+        ]
+        for call in toolCalls {
+            let id = (call["id"] as? String) ?? ""
+            messages.append(["role": "tool", "tool_call_id": id, "content": "ok"])
+        }
+        var req = URLRequest(url: url)
+        req.httpMethod = "POST"
+        req.timeoutInterval = 60
+        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        if !apiKey.isEmpty { req.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization") }
+        let body: [String: Any] = ["model": model, "messages": messages, "max_tokens": 300]
+        guard let payload = try? JSONSerialization.data(withJSONObject: body) else { return }
+        req.httpBody = payload
+
+        URLSession.shared.dataTask(with: req) { [weak self] data, _, _ in
+            DispatchQueue.main.async {
+                guard let self else { return }
+                var reply = ""
+                if let data,
+                   let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                   let choices = json["choices"] as? [[String: Any]],
+                   let first = choices.first,
+                   let msg = first["message"] as? [String: Any],
+                   let content = msg["content"] as? String {
+                    reply = content.trimmingCharacters(in: .whitespacesAndNewlines)
+                }
+                if reply.isEmpty {
+                    reply = "（小鲸鱼鼓了鼓腮帮子）"
+                    self.handleJSEvent("TOOL_CONTINUE: empty, fallback")
+                } else {
+                    self.handleJSEvent("TOOL_CONTINUE: ok chars=\(reply.count)")
+                }
+                self.isAIReplying = false
+                self.showBubble(reply)
+                self.speak(reply, emotion: emotion)
+                if let motion {
+                    let js = "window.__setMotion ? window.__setMotion('\\(self.jsEscapedString(motion))') : 0"
+                    self.webView.evaluateJavaScript(js, completionHandler: nil)
+                }
+                if let moveTarget {
+                    self.moveWindow(xPercent: moveTarget.0, yPercent: moveTarget.1,
+                                    reason: "ai", duration: 1.2)
+                }
+            }
+        }.resume()
+    }
+
     // 调 AI (自定义 API 优先, 否则 Hermes gateway)
     func askHermes(_ text: String) {
         dispatchPrecondition(condition: .onQueue(.main))
+        let userText = text          // 原始用户输入, 后续闭包里 text 会被解析结果覆盖
         let requestStartedAt = Date()
         markActivity()
         isAIReplying = true
@@ -1394,7 +1456,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
                     text = spaces.stringByReplacingMatches(in: text, range: NSRange(text.startIndex..., in: text), withTemplate: " ")
                 }
                 // 即使模型只返回工具调用，也始终给气泡和语音一个可见文本。
-                if text.isEmpty { text = "主人~" }
+                // 但不能拿固定串糊过去 (之前是写死 "主人~", 导致只回一句"主人")。
+                // 正确做法: 工具调用的回程 —— 把 tool_calls 与结果回填给模型, 让它
+                // 按 OpenAI 协议续写出正文。tool_calls 的即时副作用已经触发过了,
+                // 这里只要正文; 续写失败才用兜底文案。
+                if text.isEmpty && !toolCalls.isEmpty {
+                    self.continueAfterToolCalls(
+                        fullPrompt: fullPrompt,
+                        userText: userText,
+                        assistantMsg: msg,
+                        toolCalls: toolCalls,
+                        baseURL: baseURL,
+                        apiKey: apiKey,
+                        model: model,
+                        emotion: emotion, motion: motion, moveTarget: moveTarget
+                    )
+                    return
+                }
+                if text.isEmpty { text = "（小鲸鱼歪了歪头）" }
                 // 触发情绪表情
                 if let emotion {
                     let js = "window.__setEmotion ? window.__setEmotion('\(self.jsEscapedString(emotion))') : 0"
@@ -1845,8 +1924,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
             ttsDaemonInput?.write(requestData + Data([0x0a]))
             let backend = ttsBackend(for: voice)
             handleJSEvent("TTS_GENERATE: backend=\(backend) voice=\(voice) emotion=\(emotion ?? "default")")
-            // 火山双向流式通常 <1.5s；edge-tts 网络合成可能 3-6s。看门狗: 超时未产出 → 转系统本地 TTS
-            let watchdogSeconds: Double = backend == "volc" ? 2.5 : 4.0
+            // 火山双向流式实测 1.0~1.5s (含首包); edge-tts 网络合成可能 3-6s。
+            // 阈值别卡太紧: 之前 2.5s, 网络稍抖就超时降级, 用户听到的是无感情的本地
+            // Tingting 而不是有感情的火山音色。降到系统 TTS 的代价比多等 1 秒大得多。
+            let watchdogSeconds: Double = backend == "volc" ? 4.0 : 6.0
             let watchdog = DispatchWorkItem { [weak self] in
                 guard let self, self.speechRequestID == requestID, self.ttsDaemonCompletion != nil,
                       self.speechPlayer == nil || self.speechPlayer?.timeControlStatus != .playing else { return }
@@ -1875,9 +1956,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
         ttsDaemonBuffer.removeAll(keepingCapacity: true)
         let process = Process()
         let environment = ProcessInfo.processInfo.environment
-        let venv = environment["TTS_VENV"] ?? "/tmp/ttsvenv"
+        // venv 不能在 /tmp —— 系统会定期清理 /tmp, 把 pyvenv.cfg 删掉后 venv 就废了
+        // (python 不再把 site-packages 加进 sys.path, import websockets 直接失败,
+        //  volc TTS 静默降级到无感情的本地 Tingting)。放 Application Support 才持久。
+        let defaultVenv = "\(NSHomeDirectory())/Library/Application Support/WhalePet/ttsvenv"
+        let venv = environment["TTS_VENV"] ?? defaultVenv
         let venvPython = venv + "/bin/python"
-        process.executableURL = URL(fileURLWithPath: FileManager.default.isExecutableFile(atPath: venvPython) ? venvPython : "/usr/bin/python3")
+        // venv 健全性: 有 pyvenv.cfg 才算真 venv。缺了说明目录被系统清理过,
+        // python 不会读它的 site-packages, 硬用只会 import 失败 → 直接退回系统 python 也别
+        // 假装是 venv。这次先走本地 TTS, 下次装好 venv 自动恢复。
+        let cfgOK = FileManager.default.fileExists(atPath: venv + "/pyvenv.cfg")
+        if !cfgOK {
+            handleJSEvent("TTS_VENV_BROKEN: \(venv) 缺 pyvenv.cfg (被系统清理过), 本次降级")
+        }
+        let usableVenvPython = cfgOK && FileManager.default.isExecutableFile(atPath: venvPython)
+        process.executableURL = URL(fileURLWithPath: usableVenvPython ? venvPython : "/usr/bin/python3")
         process.arguments = [helper, "--daemon"]
         var childEnvironment = environment
         childEnvironment["TTS_VENV"] = venv
