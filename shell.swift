@@ -342,6 +342,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
     private var sessionReservedAt: TimeInterval = 0
     private let webLogQueue = DispatchQueue(label: "WhalePet.webview-log")
     private var webLogHandle: FileHandle?
+    private var webLogBytes: UInt64?   // 内存累计的日志大小, 避免每行一次 stat
+    private var lastLoggedCharRect: CGRect = .zero   // 角色区域日志去重
     // 尺寸设置: x1~x5, 当前为 x3 (400x560)
     var currentScale: Int = 3
     let baseSize = CGSize(width: 400.0 / 3.0, height: 560.0 / 3.0)  // x1 基准 ≈133x187
@@ -2423,7 +2425,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
     var debugTimer: Timer?
     func startDebugScaleWatcher() {
         guard let debugDirectory = debugCommandDirectory() else { return }
-        debugTimer = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { [weak self] _ in
+        // 性能: 原 0.5s 一次, 每轮 5 次文件读取 (存在性检查 + 内容) —— 空闲时也在
+        // 持续唤醒主线程。调试命令是人在敲, 1.5s 延迟完全够用, 唤醒频率降到 1/3。
+        debugTimer = Timer.scheduledTimer(withTimeInterval: 1.5, repeats: true) { [weak self] _ in
             guard let self else { return }
             let emoPath = debugDirectory + "/pet_emotion_cmd"
             if let emoTxt = try? String(contentsOfFile: emoPath, encoding: .utf8) {
@@ -2491,7 +2495,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
                       let w = (body["w"] as? NSNumber)?.doubleValue,
                       let h = (body["h"] as? NSNumber)?.doubleValue {
                 dragView?.characterRect = CGRect(x: x, y: y, width: w, height: h)
-                handleJSEvent("CHAR_RECT: \(Int(x)),\(Int(y)) \(Int(w))x\(Int(h))")
+                // 只在尺寸真的变了才记日志: resize 期间通知很密集, 每次写盘没必要。
+                let rect = CGRect(x: x, y: y, width: w, height: h)
+                if self.lastLoggedCharRect != rect {
+                    self.lastLoggedCharRect = rect
+                    handleJSEvent("CHAR_RECT: \(Int(x)),\(Int(y)) \(Int(w))x\(Int(h))")
+                }
             }
         }
     }
@@ -2507,13 +2516,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
             let fm = FileManager.default
             try? fm.createDirectory(atPath: (path as NSString).deletingLastPathComponent,
                                     withIntermediateDirectories: true)
-            let size = ((try? fm.attributesOfItem(atPath: path)[.size]) as? NSNumber)?.uint64Value ?? 0
-            if size + UInt64(data.count) > 5 * 1024 * 1024 {
+            // 性能: 原来每写一行都要 attributesOfItem (一次 stat 系统调用), 高频
+            // 诊断日志下这本身就成了开销。改成内存累加, 只在超过阈值时 stat 一次做校准。
+            if self.webLogBytes == nil {
+                let size = ((try? fm.attributesOfItem(atPath: path)[.size]) as? NSNumber)?.uint64Value ?? 0
+                self.webLogBytes = size
+            }
+            self.webLogBytes! += UInt64(data.count)
+            if self.webLogBytes! > 5 * 1024 * 1024 {
                 try? self.webLogHandle?.close()
                 self.webLogHandle = nil
                 let first = path + ".1"
                 try? fm.removeItem(atPath: first)
                 if fm.fileExists(atPath: path) { try? fm.moveItem(atPath: path, toPath: first) }
+                self.webLogBytes = 0
             }
             if self.webLogHandle == nil {
                 if !fm.fileExists(atPath: path) { fm.createFile(atPath: path, contents: nil) }
@@ -2536,7 +2552,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
             let g = groups[Int.random(in: 0..<groups.count)]
             let js = "try { window.__setMotion ? window.__setMotion('\(g)') : window.__petModel.motion('\(g)', 0, 3); 'ok' } catch(e) { 'err:' + e.message }"
             self.webView.evaluateJavaScript(js) { result, err in
-                self.handleJSEvent("AUTO_MOTION: \(g) -> \(result ?? "nil") err=\(String(describing: err))")
+                // 只在失败时记日志: 成功日志每 25s 一条纯属噪音, 还会走一遍
+                // JS->Swift->磁盘全链路, 对排查没有价值。
+                if err != nil || (result as? String)?.hasPrefix("err") == true {
+                    self.handleJSEvent("AUTO_MOTION_FAIL: \(g) -> \(result ?? "nil") err=\(String(describing: err))")
+                }
             }
             // 每 25 秒自动换动作 (演示)
             DispatchQueue.main.asyncAfter(deadline: .now() + 25) {

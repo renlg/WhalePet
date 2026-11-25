@@ -58,16 +58,21 @@ html, body {
   const H = window.innerHeight || 560
 
   // PIXI + Live2D (分辨率 1:1 逻辑像素, WebView 自己处理 DPR)
+  // antialias=false: 透明窗口 + 浮在最上层的形态下, MSAA 每帧都要额外做
+  // 一次全屏多采样解析, 是典型的"肉眼几乎看不出、电费很明显"的开销。
+  // 卡通渲染边缘本身靠贴图 alpha, 关掉肉眼差异很小。
   const app = new PIXI.Application({
     view: canvas,
     width: W,
     height: H,
     backgroundAlpha: 0,
-    antialias: true,
+    antialias: false,
     autoStart: true,
     resolution: 1,
   })
   app.ticker.maxFPS = 30
+  // 窗口被遮挡/最小化时没必要继续渲染 (见 visibilitychange 处理)
+
 
   const { Live2DModel } = PIXI.live2d
   Live2DModel.registerTicker(PIXI.Ticker)
@@ -131,7 +136,11 @@ html, body {
     model.internalModel.on('beforeModelUpdate', () => {
       if (!window.__bmCount) window.__bmCount = 0
       window.__bmCount++
-      if (window.__bmCount === 1 || window.__bmCount % 300 === 0) {
+      // 诊断探针默认关闭: 每 300 帧打一次 console 会在 30fps 下每 10s 唤醒一次,
+      // 且 console → Swift → 磁盘全链路过一遍。需要时用
+      //   window.__bmDiag = true
+      // 在调试端点打开即可, 平时不产生任何日志。
+      if (window.__bmDiag && (window.__bmCount === 1 || window.__bmCount % 300 === 0)) {
         console.log('BM_DIAG: n=' + window.__bmCount + ' talking=' + talking)
       }
       if (!talking) {
@@ -163,9 +172,10 @@ html, body {
       const cm = model.internalModel.coreModel
       cm.setParameterValueById('ParamMouthOpenY', mouthOpen)
       // 诊断: 读回实际值, 判断"写了但模型不认"还是"回调没触发"
+      // 默认关闭 (getParameterValueById 有成本, 且逐帧路径上不该有日志)。
       if (!window.__mouthDiagCount) window.__mouthDiagCount = 0
       window.__mouthDiagCount++
-      if (window.__mouthDiagCount === 1 || window.__mouthDiagCount % 60 === 0) {
+      if (window.__mouthDiag && (window.__mouthDiagCount === 1 || window.__mouthDiagCount % 60 === 0)) {
         let readback = 'ERR'
         try { readback = String(cm.getParameterValueById('ParamMouthOpenY')) } catch(e) { readback = 'THROW:' + e }
         let idx = -1
@@ -407,7 +417,8 @@ html, body {
       }
       if (played === true) {
         currentGroup = group
-        console.log('set motion:', group)
+        // 动作切换日志在自动演示下每分钟好几条, 只在显式调试时输出。
+        if (window.__motionDiag) console.log('set motion:', group)
         return true
       }
       console.error('set motion not played:', group)
@@ -525,6 +536,18 @@ html, body {
       console.error('expression reset error:', e)
     }
   }
+
+  // 省电: 窗口被完全遮挡 / 最小化 / 隐藏时, WKWebView 的 requestAnimationFrame
+  // 已经会被系统降频, 但 PIXI 的 ticker 仍可能空转重绘。显式停掉渲染循环,
+  // 比让 GPU 一直合成一个看不见的透明窗口省电得多。
+  // 注意: 不能因此让 talking 状态卡死 —— 只停渲染, 不动状态机。
+  document.addEventListener('visibilitychange', () => {
+    if (document.hidden) {
+      app.ticker.stop()
+    } else {
+      app.ticker.start()
+    }
+  })
 
   init().catch(e => {
     console.error('init error:', e)
